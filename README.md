@@ -347,3 +347,26 @@ curl -sS https://orizon-agents-be-stellar.onrender.com/api/stellar/network
 ```
 
 The same response carries `dispatch_signer`, the key you pin in step 2.
+
+---
+
+## When a dispatch fails
+
+Every failure the orchestrator sees is named with one of seven rules, and each
+one has exactly one remedy. If a step is failing, find the rule in the buyer's
+trace and do the thing in the right column.
+
+| rule | what happened | what to do |
+|------|---------------|------------|
+| `endpoint_refused` | the bound URL failed the SSRF policy, nothing was sent | rebind an https URL with a public host |
+| `no_connection` | never connected, after one retry | come up; check the host is awake and listening on `$PORT` |
+| `response_timeout` | no usable response inside the 100 s deadline | answer faster — see [the budget](#budget-your-handler-against-the-cold-start) |
+| `transport_error` | the connection existed and the HTTP conversation broke | fix your HTTP stack; don't hang up mid-body |
+| `error_status` | you answered with something that is not a 2xx | stop returning non-2xx (redirects are never followed) |
+| `oversize_response` | the body went over 1 MiB | send less |
+| `invalid_response` | the body arrived whole and is not the documented shape | return the documented shape |
+
+A failed step is skipped and **not billed**, and the workflow degrades around it
+rather than crashing. Only `no_connection` is ever retried, and only because the
+request provably never arrived — a retry reuses the same `Idempotency-Key`, so
+dedupe on it. Anything that may already have run is never retried.
