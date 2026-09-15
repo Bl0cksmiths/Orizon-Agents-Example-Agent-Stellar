@@ -149,3 +149,94 @@ MAX_SKEW_SECONDS = _env_int("ORIZON_MAX_SKEW", 300)
 # "large" is not "unbounded", and an unbounded read is a one-line denial of
 # service against a process with no memory limit.
 MAX_BODY_BYTES = _env_int("ORIZON_MAX_BODY", 8 * 1024 * 1024)
+
+
+# ---------------------------------------------------------------------------
+# What a `G…` address actually is
+# ---------------------------------------------------------------------------
+
+
+def decode_g_address(address: str) -> bytes:
+    """Decode a Stellar `G…` strkey to the 32 raw ed25519 public-key bytes.
+
+    A `G…` address is not a key. It is a 35-byte envelope, base32-encoded
+    without padding:
+
+        byte  0      version byte 0x30 — "ed25519 public key", which is what
+                     makes every one of them start with the letter G
+        bytes 1..32  the actual 32-byte ed25519 public key
+        bytes 33,34  CRC16-XMODEM over the first 33 bytes, little-endian
+
+    35 bytes is 280 bits, which is exactly 56 base32 characters, which is why
+    every Stellar address is 56 characters long and never carries an `=`.
+
+    The checksum is a TYPO guard, not a security control: it catches an address
+    mangled by a copy-paste or a line wrap, and catches nothing an adversary
+    does, because an adversary computes the checksum too. It is checked anyway
+    because the failure it prevents — pinning a corrupted signer and then
+    debugging "every signature is invalid" for an afternoon — is exactly the
+    failure an operator hits on day one.
+
+    Raises ValueError, with a message that quotes nothing: an address is public
+    so there is no secret to leak here, but the same function shape is the one
+    you would reuse for an `S…` secret, and that one must never echo its input.
+    """
+    if len(address) != 56 or not address.startswith("G"):
+        raise ValueError("not a 56-character address starting with G")
+    try:
+        # b32decode is strict about case and length; both are what we want. A
+        # lowercased address is a mangled address, not a convenience to absorb.
+        decoded = base64.b32decode(address.encode("ascii"))
+    except (binascii.Error, ValueError) as e:
+        raise ValueError("not valid base32") from e
+    if len(decoded) != 35:  # pragma: no cover — implied by the length check above
+        raise ValueError("wrong decoded length")
+    payload, checksum = decoded[:-2], decoded[-2:]
+    if decoded[0] != 0x30:
+        raise ValueError("version byte is not an ed25519 public key")
+    # crc_hqx IS CRC16-XMODEM (poly 0x1021, init 0x0000) and is stdlib; `<H`
+    # packs it little-endian, which is the byte order Stellar stores it in.
+    if struct.pack("<H", binascii.crc_hqx(payload, 0)) != checksum:
+        raise ValueError("checksum mismatch — the address is mistyped or truncated")
+    return decoded[1:-2]
+
+
+def sep53_message_hash(message: str) -> bytes:
+    """The 32 bytes a Stellar signer actually signs for a SEP-53 message.
+
+        sha256(b"Stellar Signed Message:\\n" + message.encode("utf-8"))
+
+    The prefix is the entire point. Raw `Keypair.sign()` has NO domain
+    separation: a signature over attacker-chosen bytes is structurally
+    indistinguishable from a signature over a transaction envelope, separated
+    only by length. Prefixing means a signature produced for a message can
+    never be replayed as a signature authorising a payment, and vice versa.
+
+    This is three lines because it is three lines. `stellar_sdk`'s
+    `Keypair.verify_message` is this hash followed by an ed25519 verify — the
+    same two operations, behind an import that brings six other packages.
+    """
+    return hashlib.sha256(SEP53_PREFIX + message.encode("utf-8")).digest()
+
+
+def dispatch_message(endpoint_url: str, raw_body: bytes) -> str:
+    """The exact string Orizon signed for one dispatch.
+
+        orizon-dispatch:v1:{endpoint_url}:{sha256_hex(body)}
+
+    TWO THINGS HERE ARE LOAD-BEARING.
+
+    `endpoint_url` is NOT transmitted. It is not in the body and it is not in a
+    header; the only copy on your side is the one in your own configuration.
+    That is what makes a dispatch signature non-transferable. If the URL rode
+    along in the request, a competing operator who received a dispatch could
+    replay the whole signed envelope at YOUR endpoint, your verification would
+    pass, and you would run — and bill — a job Orizon never sent you. Because
+    the URL comes from your config, their envelope rebuilds a different message
+    here and fails. You get that property for free, with nothing to remember.
+
+    `raw_body` is hashed, not embedded, so this string stays a bounded thing
+    you can log whatever the envelope grows into. It must be the bytes AS
+    RECEIVED — see `verify_dispatch`.
+    """
+    return f"{SIG_VERSION}:{endpoint_url}:{hashlib.sha256(raw_body).hexdigest()}"
