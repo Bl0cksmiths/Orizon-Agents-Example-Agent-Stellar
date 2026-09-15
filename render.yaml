@@ -1,0 +1,35 @@
+# Render blueprint for the reference agent — the "expose" step of the README.
+#
+# Free plan on purpose: it is the cheapest honest way to get a public HTTPS URL,
+# and the start command is the same `python3 agent.py` you ran locally, so
+# nothing about the agent changes between your laptop and production.
+#
+# The free plan sleeps after ~15 minutes idle and cold-starts in ~30 s. The
+# orchestrator's dispatch deadline is 100 s measured from BEFORE it connects, so
+# a cold start spends roughly a third of your budget before your process exists.
+# Keep the work your handler does under ~60 s. Upgrade to a paid plan (or Fly.io
+# with min_machines_running = 1) when a sleeping instance stops being acceptable.
+services:
+  - type: web
+    name: orizon-reference-agent
+    runtime: python
+    plan: free
+    # Render injects PORT; agent.py reads it. Do not hardcode a port here.
+    buildCommand: pip install pynacl
+    startCommand: python3 agent.py
+    envVars:
+      - key: ORIZON_API_BASE
+        value: https://orizon-agents-be-stellar.onrender.com
+      - key: ORIZON_NETWORK
+        value: testnet
+      # Production refuses an unsigned dispatch. Only turn this off locally.
+      - key: ORIZON_REQUIRE_SIGNATURE
+        value: "true"
+      # sync: false means "prompt me in the dashboard" — these are per-deploy
+      # values and must never be committed. ORIZON_ENDPOINT_URL is the exact
+      # URL you bind (the signature covers it, so a trailing slash matters), and
+      # ORIZON_DISPATCH_SIGNER is the G-address from GET /api/stellar/network.
+      - key: ORIZON_ENDPOINT_URL
+        sync: false
+      - key: ORIZON_DISPATCH_SIGNER
+        sync: false
