@@ -869,3 +869,205 @@ def build_response(result: dict) -> bytes:
             )
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     return body
+
+
+# ---------------------------------------------------------------------------
+# The server
+# ---------------------------------------------------------------------------
+
+
+class DispatchHandler(BaseHTTPRequestHandler):
+    # HTTP/1.1 so connections are reused across a workflow's steps, which is
+    # worth several hundred milliseconds of TLS setup out of your budget. It
+    # obliges us to send an accurate Content-Length on every response, which
+    # `_respond` does; get that wrong and the step fails as `transport_error`.
+    protocol_version = "HTTP/1.1"
+    server_version = "orizon-example-agent/1"
+    # A read timeout on the connection. Without one, a client that opens a
+    # socket and sends nothing holds a thread until the process dies — the
+    # cheapest denial of service there is against a threaded server.
+    timeout = 30
+
+    def log_message(self, fmt: str, *args) -> None:
+        """Route access logging through `logging`, WITHOUT the request line.
+
+        The default implementation prints `"POST /dispatch?token=… HTTP/1.1"`
+        to stderr. A bound endpoint may legitimately carry a shared secret in
+        its query string, and that is the one thing that must never reach a log
+        file, a log shipper, or a screenshot. So the path is dropped; the
+        outcome is logged where it is produced instead.
+        """
+        logger.debug("http %s", fmt % args)
+
+    def _respond(self, status: int, body: bytes) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _refuse(self, status: int, reason: str) -> None:
+        """Answer a request we will not run.
+
+        The body is for YOU, reading curl output — Orizon never parses a
+        non-2xx body, it just records the step as `error_status`. A refused
+        step is not billed, which is why refusing is always cheaper than
+        guessing.
+        """
+        logger.warning("refused dispatch: %s", reason)
+        self._respond(status, json.dumps({"error": reason}).encode("utf-8"))
+
+    def _read_body(self) -> bytes:
+        """The raw request bytes, bounded, exactly as sent.
+
+        These bytes are what the signature covers, so they are read once and
+        passed around unmodified. Nothing here decodes, strips or normalises
+        them.
+        """
+        if self.headers.get("Transfer-Encoding", "").lower().strip() == "chunked":
+            # `http.server` does not de-chunk, and Orizon always sends a
+            # Content-Length. Refusing is honest; silently reading the raw
+            # chunk framing as the body would fail the signature check with a
+            # message that sends you looking in entirely the wrong place.
+            raise Refused(411, "chunked request bodies are not accepted")
+        try:
+            length = int(self.headers.get("Content-Length", ""))
+        except ValueError as e:
+            raise Refused(411, "Content-Length is missing or not a number") from e
+        if length < 0 or length > MAX_BODY_BYTES:
+            # Checked BEFORE allocating anything. `context` grows with every
+            # prior step in a workflow, so envelopes are genuinely large — but
+            # "large" has a number and "unbounded" does not.
+            raise Refused(413, f"body of {length} bytes exceeds the {MAX_BODY_BYTES}-byte limit")
+        chunks, remaining = [], length
+        while remaining > 0:
+            chunk = self.rfile.read(min(remaining, 65536))
+            if not chunk:
+                raise Refused(400, "request body ended early")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks)
+
+    def do_GET(self) -> None:
+        """A liveness probe, and a one-glance check of the two settings that
+        are most often wrong."""
+        self._respond(
+            200,
+            json.dumps(
+                {
+                    "ok": True,
+                    "endpoint_url": ENDPOINT_URL,
+                    "network": EXPECTED_NETWORK,
+                    "signature_required": bool(PINNED_SIGNER),
+                }
+            ).encode("utf-8"),
+        )
+
+    def do_POST(self) -> None:
+        # FIRST LINE OF THE HANDLER. Everything after this counts against the
+        # deadline, and the orchestrator's clock has already been running since
+        # before it connected.
+        started = time.monotonic()
+        dispatch_id = None
+        try:
+            raw_body = self._read_body()
+
+            # Order matters: authenticate before parsing. `json.loads` on an
+            # unauthenticated megabyte is work a stranger asked us to do.
+            trust = verify_dispatch(self.headers, raw_body)
+
+            try:
+                envelope = json.loads(raw_body)
+            except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                raise Refused(400, "body is not valid JSON") from e
+            except RecursionError as e:
+                # A megabyte of "[[[[..." is ~500k levels deep and defeats
+                # CPython's recursive scanner. RecursionError is a RuntimeError,
+                # so a `except ValueError` would not hold it and it would take
+                # the thread down instead of the request.
+                raise Refused(400, "body nesting is too deep") from e
+
+            envelope = check_envelope(envelope, self.headers)
+            dispatch_id = envelope["dispatch_id"]
+            budget = Budget(envelope, started)
+
+            # Replay before running. Half the budget is a generous wait for an
+            # in-flight twin and still leaves time to answer if it never
+            # finishes.
+            prior = LEDGER.claim(dispatch_id, wait_seconds=max(0.0, budget.remaining() / 2))
+            if prior is not None:
+                self._respond(*prior)
+                return
+
+            try:
+                result = run_step(envelope, budget)
+                body = build_response(result)
+            except Exception:
+                LEDGER.abandon(dispatch_id)
+                raise
+
+            LEDGER.complete(dispatch_id, 200, body)
+            logger.info(
+                "dispatch %s (%s) answered in %.2fs, %d bytes",
+                dispatch_id,
+                trust,
+                budget.elapsed(),
+                len(body),
+            )
+            self._respond(200, body)
+        except Refused as e:
+            self._refuse(e.status, e.reason)
+        except Exception:
+            # Our bug, not theirs. A 500 fails the step as `error_status`,
+            # which is NOT billed — strictly better for the buyer, and for you,
+            # than a 200 carrying an apology: that would be billed AND rated
+            # 20/100 for delivering nothing checkable. Never dress a failure up
+            # as a delivery.
+            if dispatch_id:
+                LEDGER.abandon(dispatch_id)
+            logger.exception("dispatch failed")
+            self._refuse(500, "internal error")
+
+
+def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+
+    if not PINNED_SIGNER:
+        logger.warning(
+            "ORIZON_SIGNER is not set: this agent will run UNVERIFIED dispatches. Fetch "
+            "GET /api/stellar/network -> dispatch_signer and pin it before binding a public URL."
+        )
+    elif not ENDPOINT_URL.startswith("https://"):
+        # Not fatal — you may be testing behind a tunnel — but a bound endpoint
+        # must be https, and the URL is inside the signed message, so an
+        # http/https mismatch between what you bound and what is configured
+        # here makes EVERY signature fail with no other symptom.
+        logger.warning("ORIZON_ENDPOINT_URL is not https — it must byte-match the URL you bound")
+
+    server = ThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), DispatchHandler)
+    # Threads die with the process; a dispatch in flight at shutdown is a step
+    # that fails and is not retried, which is the correct outcome — the
+    # alternative is a shutdown that hangs on a 100-second budget.
+    server.daemon_threads = True
+    logger.info(
+        "listening on http://%s:%d — signing in as %s, network %s, signature %s",
+        LISTEN_HOST,
+        LISTEN_PORT,
+        ENDPOINT_URL,
+        EXPECTED_NETWORK,
+        "required" if PINNED_SIGNER else "NOT CHECKED",
+    )
+    # Plain HTTP on purpose. Orizon requires an HTTPS endpoint, and terminating
+    # TLS belongs in front of this process — a reverse proxy, a platform
+    # router, a tunnel — not in a file whose job is to be readable. Bind to
+    # 127.0.0.1 (the default) and let that proxy be the only thing exposed.
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        logger.info("shutting down")
+    finally:
+        server.server_close()
+
+
+if __name__ == "__main__":
+    main()
