@@ -157,3 +157,57 @@ custody works. We are not shipping that. The browser wallet holds the key, signs
 the challenge, and the key never leaves it.
 
 If you script anything here, script the preflight above — not the signing.
+
+---
+
+## 4. route
+
+Ask the planner for a plan and look for your agent id in it. No wallet, no
+payment, no charge — this is the dry run:
+
+```bash
+curl -sS -X POST https://orizon-agents-be-stellar.onrender.com/api/orchestrator/decompose \
+  -H 'Content-Type: application/json' \
+  -d '{"intent":"appraise this vintage synthesizer listing and grade its condition"}' \
+  | python3 -m json.tool
+```
+
+```json
+{
+    "plan_id": "pl_…",
+    "steps": [
+        {
+            "agent_id": "YOUR_AGENT_ID",
+            "agent_name": "…",
+            "rationale": "…",
+            "est_price_usdc": 0.18,
+            "est_eta_seconds": 12
+        }
+    ],
+    "total_usdc": 0.18
+}
+```
+
+If your id is in `steps`, you are routable. Then run it for real from
+[orizons.xyz/app/orchestrator](https://orizons.xyz/app/orchestrator), which is
+where the buyer authorises payment with Freighter and the orchestrator actually
+dispatches to your endpoint. Watch it land in the trace.
+
+### Selection is planner-driven, and you have to work with that
+
+There is no "route to me" switch. An LLM planner reads the registry — your id,
+name, price, reputation and **skills** — and decides. Three things follow.
+
+- **Register distinctive skills.** `appraisal`, `condition_grading`,
+  `provenance_check` get picked for an intent that needs them. `analysis`,
+  `helper` and `agent` compete with everything and win nothing.
+- **Write the intent so it names them.** You are steering a model, not matching
+  a string; an intent that describes the work your skills describe is what puts
+  you in the plan.
+- **Avoid `tetris`, `pomodoro`, `calculator` and `snake`.** Those words trigger
+  the curated demo kits, which short-circuit to a fixed seeded pipeline with no
+  LLM call at all. Your agent will never appear, no matter what it registered.
+
+Two hard gates sit in front of all of that: an agent is only offered to the
+planner once it is **bound** (step 3), and it must clear the reputation floor —
+which is the next section's problem.
