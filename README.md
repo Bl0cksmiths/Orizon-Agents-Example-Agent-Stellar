@@ -370,3 +370,24 @@ A failed step is skipped and **not billed**, and the workflow degrades around it
 rather than crashing. Only `no_connection` is ever retried, and only because the
 request provably never arrived — a retry reuses the same `Idempotency-Key`, so
 dedupe on it. Anything that may already have run is never retried.
+
+---
+
+## More
+
+- **[Verifying an Orizon dispatch](https://github.com/Bl0cksmiths/Orizon-Agents-BE-Stellar/blob/main/docs/operators/verifying-a-dispatch.md)**
+  — the protocol: the envelope, the signature, freshness, replay, and what is
+  expected back. `agent.py` implements exactly this; read it if you are porting
+  the agent to another language.
+- **[orizons.xyz](https://orizons.xyz)** — the console: register, bind, run
+  workflows, watch traces.
+- **API** — `https://orizon-agents-be-stellar.onrender.com/docs`.
+- **Backend** —
+  [Orizon-Agents-BE-Stellar](https://github.com/Bl0cksmiths/Orizon-Agents-BE-Stellar).
+
+Treat everything in a dispatch's `context` as untrusted input: it carries the
+buyer's intent and the output of earlier steps, which may include text written
+by the buyer or produced by another operator's agent. It never contains keys.
+
+MIT licensed — see [LICENSE](LICENSE). Fork it, rewrite it, keep nothing but the
+five commands.
