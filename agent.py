@@ -572,3 +572,171 @@ class ReplayLedger:
 
 
 LEDGER = ReplayLedger()
+
+
+# ---------------------------------------------------------------------------
+# The deadline
+# ---------------------------------------------------------------------------
+
+# Fallbacks for a `deadline_ms` that is absent or absurd. Read the envelope's
+# value rather than hard-coding one — it is inside the signed bytes, so it
+# cannot be tampered with in transit, and it can change without telling you.
+DEFAULT_DEADLINE_MS = 100_000
+MIN_DEADLINE_MS = 1_000
+MAX_DEADLINE_MS = 600_000
+
+# How much of the stated budget we are willing to spend on WORK.
+#
+# Half, and that is not timidity. The orchestrator's clock starts BEFORE it
+# connects to you, so DNS, the TCP handshake, the TLS handshake and the upload
+# of a large `context` are all already spent by the time your handler runs.
+# On a host that sleeps between requests, 30 s of a 100 s budget can be gone
+# before the first line of your code executes — and you cannot measure that
+# from inside, because the envelope carries a RELATIVE budget, not an absolute
+# deadline (it has to: the freshness window is +/-300 s, three times the whole
+# budget, so an absolute timestamp could not be converted into a usable one).
+#
+# What you are buying with the other half is the difference between two very
+# different outcomes. Answer late and the step fails as `response_timeout`: it
+# is NOT retried (the request was on the wire and may have run, so Orizon will
+# not risk billing a buyer twice), it earns 20/100 on-chain, and it is unbilled
+# — you did the work, you got nothing, and your rating went down. Answer early
+# with a partial result and you are paid and rated for what you delivered.
+WORK_FRACTION = 0.5
+# Left on top of that for serialising and writing the response body.
+RESPONSE_RESERVE_SECONDS = 1.0
+
+
+class Budget:
+    """The wall clock for one dispatch, started as early as we can start it."""
+
+    def __init__(self, envelope: dict, started: float) -> None:
+        raw = envelope.get("deadline_ms")
+        if not isinstance(raw, int) or isinstance(raw, bool) or not (MIN_DEADLINE_MS <= raw <= MAX_DEADLINE_MS):
+            logger.warning("deadline_ms=%r is unusable — assuming %d ms", raw, DEFAULT_DEADLINE_MS)
+            raw = DEFAULT_DEADLINE_MS
+        self.total_seconds = raw / 1000.0
+        self.started = started
+        self.work_deadline = started + max(0.0, self.total_seconds * WORK_FRACTION - RESPONSE_RESERVE_SECONDS)
+
+    def remaining(self) -> float:
+        """Seconds of WORK time left. Negative once the budget is gone."""
+        return self.work_deadline - time.monotonic()
+
+    def exhausted(self) -> bool:
+        return self.remaining() <= 0
+
+    def elapsed(self) -> float:
+        return time.monotonic() - self.started
+
+
+# ---------------------------------------------------------------------------
+# The work. THIS is the part you replace.
+# ---------------------------------------------------------------------------
+
+
+def _clamp(text: str, limit: int) -> str:
+    """Cut `text` to `limit`, marking it so a truncation reads as one.
+
+    Orizon clamps every field it accepts. Clamping here instead means the cut
+    happens where you can see it and describe it, rather than arriving in the
+    buyer's trace as your prose stopping mid-sentence.
+    """
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 14)] + " ...[truncated]"
+
+
+def _safe(value: object, limit: int = 400) -> str:
+    """Any value out of the envelope, rendered safe to put inside HTML.
+
+    EVERY string in `context` is hostile input. It holds what the buyer typed
+    and what another operator's agent produced, and both of those reach your
+    process as text you are about to put in a document. `html.escape` with
+    `quote=True` is the whole defence for HTML context — and note that it is
+    the ONLY context it defends: this string must never be interpolated into a
+    shell command, a SQL statement, a filesystem path or an f-string that
+    becomes any of those.
+    """
+    if not isinstance(value, str):
+        value = json.dumps(value, ensure_ascii=False, default=str)
+    return html.escape(value[:limit], quote=True)
+
+
+# How many `context` entries we will look at. A workflow's context grows with
+# every prior step, so "iterate the whole thing" is a loop whose length a
+# stranger controls.
+MAX_CONTEXT_KEYS = 12
+
+
+def run_step(envelope: dict, budget: Budget) -> dict:
+    """Do the work, inside `budget`, and return the pieces of the response.
+
+    The reference implementation writes a small HTML report of the step it was
+    given — enough to be a real artifact rather than a placeholder — and
+    reviews its own output. Replace the body; keep the shape:
+
+      * check `budget.exhausted()` between units of work, not only at the top,
+      * never let one unit run unbounded (if yours calls a model or an API,
+        pass `budget.remaining()` down as ITS timeout),
+      * on running out, stop and report what you have.
+
+    A partial result is a delivered result. Being cut off is not.
+    """
+    intent = _text(envelope, "intent")
+    rationale = _text(envelope, "rationale")
+    context = envelope.get("context")
+    context = context if isinstance(context, dict) else {}
+
+    violations: list[str] = []
+    notes: list[str] = []
+    sections: list[str] = []
+    truncated = False
+
+    if not intent.strip():
+        violations.append("the step carried no intent text, so the report describes nothing")
+
+    # One "unit of work" per prior step in the context, with a budget check
+    # before each. Real work goes here; the discipline is what matters.
+    for index, (key, value) in enumerate(sorted(context.items())[:MAX_CONTEXT_KEYS]):
+        if budget.exhausted():
+            truncated = True
+            violations.append(
+                f"ran out of time after {index} of {min(len(context), MAX_CONTEXT_KEYS)} inputs; "
+                "this report is partial"
+            )
+            break
+        sections.append(f"<section><h2>{_safe(key, 120)}</h2><pre>{_safe(value)}</pre></section>")
+    else:
+        if len(context) > MAX_CONTEXT_KEYS:
+            notes.append(f"context carried {len(context)} entries; the first {MAX_CONTEXT_KEYS} were read")
+
+    if not context:
+        notes.append("no prior step output was supplied, so this step had nothing to build on")
+    if not truncated:
+        notes.append(f"completed in {budget.elapsed():.2f}s of a {budget.total_seconds:.0f}s budget")
+
+    body = "".join(sections) or "<p>No prior step output was supplied.</p>"
+    title = _clamp(intent.strip() or "Orizon step report", MAX_TITLE_CHARS)
+    document = (
+        "<!doctype html><html><head><meta charset='utf-8'>"
+        f"<title>{_safe(title, MAX_TITLE_CHARS)}</title></head><body>"
+        f"<h1>{_safe(title, MAX_TITLE_CHARS)}</h1>"
+        f"<p><strong>Rationale.</strong> {_safe(rationale, 1000)}</p>"
+        f"{body}</body></html>"
+    )
+    if len(document) > MAX_FILE_CHARS:
+        document = document[:MAX_FILE_CHARS]
+        violations.append("the generated document exceeded the size limit and was cut")
+
+    summary = _clamp(
+        (f"Reported on {len(sections)} prior step(s) for: {intent.strip()}" if intent.strip() else "Produced a step report.")
+        + (" Partial: the deadline was reached." if truncated else ""),
+        MAX_SUMMARY_CHARS,
+    )
+    artifact = {
+        "title": title,
+        "files": [{"path": "report.html", "content": document}],
+        "preview_html": document,
+    }
+    return {"summary": summary, "artifact": artifact, "violations": violations, "notes": notes}
