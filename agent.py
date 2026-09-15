@@ -144,11 +144,10 @@ def decode_g_address(address: str) -> bytes:
     35 bytes is 280 bits, which is exactly 56 base32 characters — which is why
     every Stellar address is 56 long and never carries an `=`.
 
-    The checksum is a TYPO guard, not a security control: an adversary computes
-    it too. It is checked because the failure it prevents — pinning a corrupted
-    signer, then debugging "every signature is invalid" for an afternoon — is
-    the one an operator hits on day one. The error quotes nothing: harmless for
-    a public address, but this is the shape you would reuse for an `S…` secret.
+    The checksum is a TYPO guard, not a security control — an adversary
+    computes it too. It is checked because the failure it prevents (pinning a
+    corrupted signer, then debugging "every signature is invalid") is the one
+    an operator hits on day one.
     """
     if len(address) != 56 or not address.startswith("G"):
         raise ValueError("not a 56-character address starting with G")
@@ -191,16 +190,15 @@ def dispatch_message(endpoint_url: str, raw_body: bytes) -> str:
         orizon-dispatch:v1:{endpoint_url}:{sha256_hex(body)}
 
     `endpoint_url` is NOT transmitted — not in the body, not in a header. The
-    only copy on your side is your own configuration, and that is what makes a
-    dispatch signature non-transferable: if the URL rode along in the request,
-    a competing operator who received a dispatch could replay the whole signed
+    only copy on your side is your own configuration, and that is what makes
+    the signature non-transferable: if the URL rode along in the request, a
+    competing operator who received a dispatch could replay the whole signed
     envelope at YOUR endpoint, pass your verification, and have you run — and
     bill — a job Orizon never sent you. Because the URL comes from your config,
-    their envelope rebuilds a different message here and fails. Free property,
-    nothing to remember.
+    their envelope rebuilds a different message here and fails.
 
-    `raw_body` is hashed rather than embedded so this stays a bounded, loggable
-    string. It must be the bytes AS RECEIVED — see `verify_dispatch`.
+    `raw_body` is hashed, not embedded, so this stays bounded and loggable. It
+    must be the bytes AS RECEIVED — see `verify_dispatch`.
     """
     return f"{SIG_VERSION}:{endpoint_url}:{hashlib.sha256(raw_body).hexdigest()}"
 
@@ -328,10 +326,9 @@ def verify_dispatch(headers, raw_body: bytes) -> str:
         # problem at Orizon's end that does not exist.
         raise Refused(500, f"ORIZON_SIGNER is not a usable address ({e})") from e
 
-    # The URL comes from OUR configuration. Never from the request — not from a
-    # Host header, not from `self.path`, not from a field in the body. An
-    # attacker controls all three, and a verifier that rebuilds the message out
-    # of attacker-supplied pieces verifies that the attacker is self-consistent.
+    # ENDPOINT_URL is OUR configuration — never a Host header, `self.path`, or
+    # a body field. A verifier that rebuilds the message out of
+    # attacker-supplied pieces only proves the attacker is self-consistent.
     message = dispatch_message(ENDPOINT_URL, raw_body)
     try:
         VerifyKey(signer_key).verify(sep53_message_hash(message), signature)
@@ -364,8 +361,8 @@ def _text(envelope: dict, key: str) -> str:
 def check_envelope(envelope: object, headers) -> dict:
     """Validate the decoded envelope, or raise `Refused`. Returns it unchanged.
 
-    Ordered cheapest-first, and all of it runs AFTER the signature check, so an
-    unsigned caller cannot use these branches to probe what we accept.
+    All of it runs AFTER the signature check, so an unsigned caller cannot use
+    these branches to probe what we accept.
     """
     if not isinstance(envelope, dict):
         raise Refused(400, "body is not a JSON object")
@@ -509,11 +506,10 @@ def _clamp(text: str, limit: int) -> str:
 def esc(value: object) -> str:
     """Any value out of the envelope, made safe to place inside HTML.
 
-    EVERY string in `context` is hostile input: it is what the buyer typed and
-    what another operator's agent produced. `html.escape(quote=True)` is the
-    whole defence for HTML — and it defends ONLY that context. The same string
-    must never be interpolated into a shell command, a SQL statement, a
-    filesystem path, or an f-string that becomes one of those.
+    EVERY string in `context` is hostile input — what the buyer typed and what
+    another operator's agent produced. `html.escape(quote=True)` defends HTML
+    and ONLY HTML: the same string must never reach a shell command, a SQL
+    statement, a filesystem path, or an f-string that becomes one.
     """
     if not isinstance(value, str):
         value = json.dumps(value, ensure_ascii=False, default=str)
@@ -529,13 +525,12 @@ MAX_CONTEXT_KEYS = 12
 def run_step(envelope: dict, deadline: float) -> dict:
     """Do the work, finishing before `deadline`, and return the response parts.
 
-    The reference implementation writes a small HTML report of the step it was
-    given — a real artifact rather than a placeholder — and reviews its own
-    output. Replace the body; keep the shape:
+    The reference implementation writes a small HTML report of the step — a
+    real artifact, not a placeholder. Replace the body; keep the shape:
 
-      * check the clock between units of work, not only at the top,
+      * check the clock between units of work, not only at the top;
       * never let one unit run unbounded (if yours calls a model or an API,
-        pass the time left down as ITS timeout),
+        pass the time left down as ITS timeout);
       * on running out, stop and report what you have.
 
     A partial result is a delivered result. Being cut off is not.
