@@ -4,34 +4,25 @@
     $ pip install pynacl
     $ python3 agent.py
 
-One file. One third-party dependency. Read it top to bottom and you will know
-everything an operator needs to know about receiving a dispatch safely.
+Orizon's orchestrator plans a buyer's workflow, picks an agent for each step,
+and POSTs that step as a JSON envelope to the HTTPS endpoint its operator
+bound. This file is the other side of that POST: a stdlib HTTP server that
+proves the request came from Orizon, works inside the budget it was given, and
+answers in the shape the orchestrator accepts. Read it top to bottom.
 
-WHAT THIS IS
-    Orizon's orchestrator plans a buyer's workflow, picks an agent for each
-    step, and POSTs that step as a JSON envelope to the HTTPS endpoint the
-    agent's operator bound. This file is the other side of that POST: a
-    stdlib HTTP server that verifies the request really came from Orizon,
-    does a small piece of work inside the budget it was given, and answers in
-    the shape the orchestrator accepts.
+It is a STARTING POINT, not a framework. Replace `run_step`; keep the rest.
 
-    It is a STARTING POINT, not a framework. Replace `run_step` with your real
-    agent; keep everything above and below it.
+PyNaCl is the only dependency. `stellar-sdk` would give us
+`Keypair.verify_message` in one line and cost seven transitive packages and
+~12 MB to do it — and every dependency is a chance for your environment to
+differ from ours, in a service whose job is to be correct at 3am. The SDK is
+itself a thin wrapper over PyNaCl here, so we call PyNaCl directly and write
+the two pieces of framing by hand: the SEP-53 message hash and the strkey
+decode. Twenty lines between them, and having them visible teaches what a `G…`
+address and a Stellar signature actually are.
 
-WHY ONLY PyNaCl
-    `stellar-sdk` would give us `Keypair.verify_message` in one line, and cost
-    seven transitive dependencies and ~12 MB to do it. Every dependency is a
-    chance for your environment to differ from ours, in a service whose whole
-    job is to be reachable and correct at 3am. stellar-sdk is itself a thin
-    wrapper over PyNaCl for this primitive, so we call PyNaCl directly and
-    write the two pieces of framing out by hand — the SEP-53 message hash and
-    the strkey decode. They are twenty lines between them, and having them
-    visible teaches what a `G…` address and a Stellar signature actually are.
-
-NO SECRETS LIVE HERE
-    This agent verifies signatures; it never makes any. It holds no private
-    key, so there is nothing in this file, its comments, or its defaults worth
-    stealing. Everything deployment-specific comes from the environment.
+No secrets live here. This agent verifies signatures and never makes any, so it
+holds no private key and there is nothing in this file worth stealing.
 
 CONFIGURATION (environment variables, all optional, all safe by default)
 
@@ -170,33 +161,27 @@ MAX_BODY_BYTES = 8 * 1024 * 1024
 def decode_g_address(address: str) -> bytes:
     """Decode a Stellar `G…` strkey to the 32 raw ed25519 public-key bytes.
 
-    A `G…` address is not a key. It is a 35-byte envelope, base32-encoded
-    without padding:
+    A `G…` address is not a key. It is a 35-byte envelope, base32-encoded:
 
         byte  0      version byte 0x30 — "ed25519 public key", which is what
                      makes every one of them start with the letter G
         bytes 1..32  the actual 32-byte ed25519 public key
         bytes 33,34  CRC16-XMODEM over the first 33 bytes, little-endian
 
-    35 bytes is 280 bits, which is exactly 56 base32 characters, which is why
-    every Stellar address is 56 characters long and never carries an `=`.
+    35 bytes is 280 bits, which is exactly 56 base32 characters — which is why
+    every Stellar address is 56 long and never carries an `=`.
 
-    The checksum is a TYPO guard, not a security control: it catches an address
-    mangled by a copy-paste or a line wrap, and catches nothing an adversary
-    does, because an adversary computes the checksum too. It is checked anyway
-    because the failure it prevents — pinning a corrupted signer and then
-    debugging "every signature is invalid" for an afternoon — is exactly the
-    failure an operator hits on day one.
-
-    Raises ValueError, with a message that quotes nothing: an address is public
-    so there is no secret to leak here, but the same function shape is the one
-    you would reuse for an `S…` secret, and that one must never echo its input.
+    The checksum is a TYPO guard, not a security control: an adversary computes
+    it too. It is checked because the failure it prevents — pinning a corrupted
+    signer, then debugging "every signature is invalid" for an afternoon — is
+    the one an operator hits on day one. The error quotes nothing: harmless for
+    a public address, but this is the shape you would reuse for an `S…` secret.
     """
     if len(address) != 56 or not address.startswith("G"):
         raise ValueError("not a 56-character address starting with G")
     try:
-        # b32decode is strict about case and length; both are what we want. A
-        # lowercased address is a mangled address, not a convenience to absorb.
+        # Strict about case and length, both of which we want: a lowercased
+        # address is a mangled address, not a convenience to absorb.
         decoded = base64.b32decode(address.encode("ascii"))
     except (binascii.Error, ValueError) as e:
         raise ValueError("not valid base32") from e
@@ -219,13 +204,10 @@ def sep53_message_hash(message: str) -> bytes:
 
     The prefix is the entire point. Raw `Keypair.sign()` has NO domain
     separation: a signature over attacker-chosen bytes is structurally
-    indistinguishable from a signature over a transaction envelope, separated
-    only by length. Prefixing means a signature produced for a message can
-    never be replayed as a signature authorising a payment, and vice versa.
-
-    This is three lines because it is three lines. `stellar_sdk`'s
-    `Keypair.verify_message` is this hash followed by an ed25519 verify — the
-    same two operations, behind an import that brings six other packages.
+    indistinguishable from one over a transaction envelope, separated only by
+    length. Prefixing means a signature made for a message can never be
+    replayed as one authorising a payment. `stellar_sdk.Keypair.verify_message`
+    is exactly this hash plus an ed25519 verify.
     """
     return hashlib.sha256(SEP53_PREFIX + message.encode("utf-8")).digest()
 
@@ -235,20 +217,17 @@ def dispatch_message(endpoint_url: str, raw_body: bytes) -> str:
 
         orizon-dispatch:v1:{endpoint_url}:{sha256_hex(body)}
 
-    TWO THINGS HERE ARE LOAD-BEARING.
+    `endpoint_url` is NOT transmitted — not in the body, not in a header. The
+    only copy on your side is your own configuration, and that is what makes a
+    dispatch signature non-transferable: if the URL rode along in the request,
+    a competing operator who received a dispatch could replay the whole signed
+    envelope at YOUR endpoint, pass your verification, and have you run — and
+    bill — a job Orizon never sent you. Because the URL comes from your config,
+    their envelope rebuilds a different message here and fails. Free property,
+    nothing to remember.
 
-    `endpoint_url` is NOT transmitted. It is not in the body and it is not in a
-    header; the only copy on your side is the one in your own configuration.
-    That is what makes a dispatch signature non-transferable. If the URL rode
-    along in the request, a competing operator who received a dispatch could
-    replay the whole signed envelope at YOUR endpoint, your verification would
-    pass, and you would run — and bill — a job Orizon never sent you. Because
-    the URL comes from your config, their envelope rebuilds a different message
-    here and fails. You get that property for free, with nothing to remember.
-
-    `raw_body` is hashed, not embedded, so this string stays a bounded thing
-    you can log whatever the envelope grows into. It must be the bytes AS
-    RECEIVED — see `verify_dispatch`.
+    `raw_body` is hashed rather than embedded so this stays a bounded, loggable
+    string. It must be the bytes AS RECEIVED — see `verify_dispatch`.
     """
     return f"{SIG_VERSION}:{endpoint_url}:{hashlib.sha256(raw_body).hexdigest()}"
 
@@ -259,13 +238,10 @@ def dispatch_message(endpoint_url: str, raw_body: bytes) -> str:
 
 
 class Refused(Exception):
-    """A request we will not run. `status` is the HTTP status to answer with.
-
-    Refusing costs the operator nothing: a non-2xx fails the step as
-    `error_status`, which is not billed. Running a forged step costs you the
+    """A request we will not run. Refusing is cheap: a non-2xx fails the step
+    as `error_status`, which is not billed. Running a forged one costs you the
     compute AND puts output you did not author into a buyer's workflow under
-    your agent id. When in doubt, refuse.
-    """
+    your agent id. When in doubt, refuse."""
 
     def __init__(self, status: int, reason: str) -> None:
         super().__init__(reason)
@@ -282,16 +258,14 @@ def verify_dispatch(headers, raw_body: bytes) -> str:
     """Decide whether to run this request. Returns VERIFIED or UNVERIFIED,
     or raises `Refused`.
 
-    `raw_body` MUST be the bytes off the socket, before `json.loads`. This is
-    the single most common way to get this wrong. If you parse first and
-    re-serialize to hash, you are hashing YOUR encoder's output, not Orizon's:
-    Python's `json.dumps` defaults to `ensure_ascii=True` and `", "`
-    separators, while the orchestrator sends
-    `json.dumps(payload, separators=(",", ":"), ensure_ascii=False)`. Those
-    agree byte for byte on pure-ASCII payloads and diverge on the first
-    accented character, emoji or CJK string a buyer types. So the bug passes
-    every test you write, ships, and then fails intermittently in production
-    on exactly the envelopes you cannot reproduce. Hash the raw bytes.
+    `raw_body` MUST be the bytes off the socket, before `json.loads` — this is
+    the single most common way to get this wrong. Parse first and re-serialize
+    to hash and you are hashing YOUR encoder's output: Python's `json.dumps`
+    defaults to `ensure_ascii=True` and `", "` separators, while the
+    orchestrator sends `separators=(",", ":"), ensure_ascii=False`. Those agree
+    byte for byte on ASCII and diverge on the first accented character, emoji or
+    CJK string a buyer types — so the bug passes every test you write, ships,
+    and then fails intermittently on the envelopes you cannot reproduce.
 
     ── THE UNSIGNED-REQUEST POLICY ────────────────────────────────────────────
     Orizon signs a dispatch only when the deployment has a dispatch key
@@ -304,12 +278,11 @@ def verify_dispatch(headers, raw_body: bytes) -> str:
         is either a misconfiguration or someone downgrading you to no
         authentication at all, and accepting it makes pinning decorative.
 
-      * ORIZON_SIGNER is EMPTY   → unsigned requests are accepted, every one of
-        them logs a WARNING, and the result is marked UNVERIFIED so the rest of
-        the file can decline to do anything expensive. This is the
-        "not configured yet" state, and it is loud on purpose: a silently
+      * ORIZON_SIGNER is EMPTY   → unsigned requests are accepted, each one
+        logs a WARNING, and the result is marked UNVERIFIED. This is the
+        "not configured yet" state and it is loud on purpose: a silently
         unauthenticated endpoint is how an agent ends up running strangers'
-        work. Pin a signer. It takes one environment variable.
+        work. Pin a signer; it is one environment variable.
 
     Choose the opposite default if you like — the doc says it is your call —
     but choose it deliberately. What you must NOT do is what the header layout
@@ -345,13 +318,12 @@ def verify_dispatch(headers, raw_body: bytes) -> str:
     if not PINNED_SIGNER:
         # ── THE TRAP ──────────────────────────────────────────────────────────
         # There is a G-address RIGHT THERE in `claimed_signer`, and verifying
-        # against it would make this branch pass. It would also be worthless.
-        # An attacker generates a keypair, signs their own forged envelope with
+        # against it would make this branch pass. It would also be worthless:
+        # an attacker generates a keypair, signs their own forged envelope with
         # it, puts their own public key in X-Orizon-Signer, and every check
-        # succeeds — because you asked the sender who to trust. The header is a
-        # debugging hint: it tells you which key Orizon BELIEVES it used, so a
-        # key rotation shows up as a mismatch instead of a mystery. It is never
-        # an input to the decision.
+        # succeeds — because you asked the sender who to trust. The header says
+        # which key Orizon BELIEVES it used, so a rotation shows up as a
+        # mismatch instead of a mystery. It is never an input to the decision.
         logger.warning(
             "dispatch carries a signature but ORIZON_SIGNER is not set, so it was NOT "
             "verified. The X-Orizon-Signer header is not a substitute: anyone can set it. "
@@ -360,9 +332,8 @@ def verify_dispatch(headers, raw_body: bytes) -> str:
         return UNVERIFIED
 
     if claimed_signer != PINNED_SIGNER:
-        # Logged, not merely refused, and this is the one place the header
-        # earns its keep: "signed by a key that is not the one I pinned" is a
-        # key rotation nine times out of ten, and you want to see it named.
+        # The one place the header earns its keep: "signed by a key that is
+        # not the one I pinned" is a key rotation nine times out of ten.
         logger.warning(
             "dispatch signed by %s but %s is pinned — refusing. If Orizon rotated its "
             "dispatch key, re-fetch GET /api/stellar/network and update ORIZON_SIGNER.",
@@ -406,12 +377,11 @@ def verify_dispatch(headers, raw_body: bytes) -> str:
 # Checking the envelope itself
 # ---------------------------------------------------------------------------
 
-# A dispatch id is hex from `secrets.token_hex(8)`. Pinning the shape means the
-# id can be used as a dict key, a log field and (if you persist results) a
-# filename without any of those becoming an injection point. Anything else is
-# refused rather than sanitised: sanitising invents a second id space where two
-# different inputs can collapse onto one entry, and an id collision in a replay
-# ledger returns one buyer's output to another.
+# A dispatch id is hex from `secrets.token_hex(8)`. Pinning the shape lets the
+# id be a dict key, a log field, or a filename without becoming an injection
+# point. Refused rather than sanitised: sanitising lets two different inputs
+# collapse onto one entry, and a collision in the replay ledger returns one
+# buyer's output to another.
 _DISPATCH_ID_RE = re.compile(r"\A[0-9a-f]{8,64}\Z")
 
 
@@ -435,30 +405,27 @@ def check_envelope(envelope: object, headers) -> dict:
     if not isinstance(dispatch_id, str) or not _DISPATCH_ID_RE.match(dispatch_id):
         raise Refused(400, "dispatch_id is missing or not lowercase hex")
 
-    # The Idempotency-Key header is OUTSIDE the signed bytes; `dispatch_id` is
-    # inside them. Requiring them to be equal is what stops a proxy — or anyone
-    # in the path — from rewriting the header to split one dispatch into two
-    # ledger entries, or to collapse two into one. They cannot touch the body
-    # copy without invalidating the signature, so pinning the header to it
+    # The header is OUTSIDE the signed bytes; `dispatch_id` is inside them.
+    # Requiring equality stops anyone in the path rewriting the header to split
+    # one dispatch into two ledger entries or collapse two into one — they
+    # cannot touch the body copy without invalidating the signature, so this
     # drags the header under the signature's protection for free.
     if headers.get(IDEMPOTENCY_HEADER) != dispatch_id:
         raise Refused(400, "Idempotency-Key does not match dispatch_id")
 
-    # Network is inside the signed bytes for a reason worth understanding: the
-    # SEP-53 preimage carries no network passphrase, unlike Stellar transaction
-    # signing. A testnet dispatch and a mainnet dispatch are therefore framed
-    # identically, and `network` is the ONLY thing separating them. Without this
-    # check, a testnet envelope — cheap to obtain — replays against a mainnet
-    # agent and settles with real money behind it.
+    # The SEP-53 preimage carries no network passphrase, unlike Stellar
+    # transaction signing, so a testnet dispatch and a mainnet one are framed
+    # identically and `network` is the ONLY thing separating them. Skip this
+    # and a testnet envelope — cheap to obtain — replays against a mainnet
+    # agent, with real money behind the settlement.
     network = envelope.get("network")
     if network != EXPECTED_NETWORK:
         raise Refused(400, f"network {network!r} is not {EXPECTED_NETWORK!r}")
 
-    # Freshness. A signature is valid forever; `ts` is what gives it an expiry.
-    # 300 s is the window the operator doc specifies — wide because it has to
-    # absorb clock skew on both machines, which is also why it cannot be
-    # narrowed into a useful budget. Bounding replay is the ledger's job, not
-    # this check's; this one bounds how long a CAPTURED envelope stays usable.
+    # A signature is valid forever; `ts` is what gives it an expiry. 300 s is
+    # the documented window — wide, because it absorbs clock skew on both
+    # machines. It bounds how long a CAPTURED envelope stays usable; bounding
+    # replay is the ledger's job, not this check's.
     ts = envelope.get("ts")
     if not isinstance(ts, int) or isinstance(ts, bool):
         raise Refused(400, "ts is missing or not an integer")
@@ -472,9 +439,9 @@ def check_envelope(envelope: object, headers) -> dict:
 
     version = envelope.get("v")
     if isinstance(version, int) and version > ENVELOPE_VERSION:
-        # Answered, not refused: every field we read has been additive so far,
-        # and refusing an envelope we could have served is a failed step and a
-        # 20/100 rating we chose for ourselves. Logged so you find out.
+        # Answered, not refused: the fields we read are additive so far, and
+        # refusing an envelope we could have served is a failed step and a
+        # 20/100 rating we chose for ourselves.
         logger.warning("envelope v%s is newer than v%d — serving it anyway", version, ENVELOPE_VERSION)
     return envelope
 
