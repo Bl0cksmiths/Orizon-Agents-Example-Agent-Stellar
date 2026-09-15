@@ -53,7 +53,6 @@ CONFIGURATION (environment variables, all optional, all safe by default)
                           (PORT is set) and 127.0.0.1 on a laptop.
     ORIZON_MAX_SKEW       Accepted clock skew on `ts`, seconds. Default 300,
                           which is what the operator doc specifies.
-    ORIZON_MAX_BODY       Largest request body accepted, bytes. Default 8 MiB.
 """
 
 from __future__ import annotations
@@ -158,11 +157,9 @@ _PLATFORM_PORT = _env("PORT", "")
 LISTEN_PORT = _env_int("PORT", 8787) if _PLATFORM_PORT else _env_int("ORIZON_PORT", 8787)
 LISTEN_HOST = _env("ORIZON_HOST", "0.0.0.0" if _PLATFORM_PORT else "127.0.0.1")
 MAX_SKEW_SECONDS = _env_int("ORIZON_MAX_SKEW", 300)
-# Bounded before a single byte is read. `context` carries the output of every
-# prior step in the workflow, so a legitimate envelope can be large — but
-# "large" is not "unbounded", and an unbounded read is a one-line denial of
-# service against a process with no memory limit.
-MAX_BODY_BYTES = _env_int("ORIZON_MAX_BODY", 8 * 1024 * 1024)
+# `context` carries every prior step's output, so envelopes are genuinely
+# large — but "large" has a number and "unbounded" does not.
+MAX_BODY_BYTES = 8 * 1024 * 1024
 
 
 # ---------------------------------------------------------------------------
@@ -418,16 +415,11 @@ def verify_dispatch(headers, raw_body: bytes) -> str:
 _DISPATCH_ID_RE = re.compile(r"\A[0-9a-f]{8,64}\Z")
 
 
-def _text(envelope: dict, key: str, limit: int = 20_000) -> str:
-    """One string field out of the envelope, clamped, never trusted.
-
-    Everything the buyer typed and everything a previous operator's agent
-    produced arrives through fields like these. A non-string is coerced to ""
-    rather than raising: the envelope's shape is Orizon's promise, but this
-    function is the boundary where that promise stops being assumed.
-    """
+def _text(envelope: dict, key: str) -> str:
+    """One string field, or "". The envelope's shape is Orizon's promise; this
+    is the boundary at which a promise stops being an assumption."""
     value = envelope.get(key)
-    return value[:limit] if isinstance(value, str) else ""
+    return value if isinstance(value, str) else ""
 
 
 def check_envelope(envelope: object, headers) -> dict:
@@ -594,20 +586,18 @@ def _clamp(text: str, limit: int) -> str:
     return text[: max(0, limit - 14)] + " ...[truncated]"
 
 
-def _safe(value: object, limit: int = 400) -> str:
-    """Any value out of the envelope, rendered safe to put inside HTML.
+def esc(value: object) -> str:
+    """Any value out of the envelope, made safe to place inside HTML.
 
-    EVERY string in `context` is hostile input. It holds what the buyer typed
-    and what another operator's agent produced, and both of those reach your
-    process as text you are about to put in a document. `html.escape` with
-    `quote=True` is the whole defence for HTML context — and note that it is
-    the ONLY context it defends: this string must never be interpolated into a
-    shell command, a SQL statement, a filesystem path or an f-string that
-    becomes any of those.
+    EVERY string in `context` is hostile input: it is what the buyer typed and
+    what another operator's agent produced. `html.escape(quote=True)` is the
+    whole defence for HTML — and it defends ONLY that context. The same string
+    must never be interpolated into a shell command, a SQL statement, a
+    filesystem path, or an f-string that becomes one of those.
     """
     if not isinstance(value, str):
         value = json.dumps(value, ensure_ascii=False, default=str)
-    return html.escape(value[:limit], quote=True)
+    return html.escape(value, quote=True)
 
 
 # How many `context` entries we will look at. A workflow's context grows with
@@ -653,7 +643,7 @@ def run_step(envelope: dict, deadline: float) -> dict:
                 "this report is partial"
             )
             break
-        sections.append(f"<section><h2>{_safe(key, 120)}</h2><pre>{_safe(value)}</pre></section>")
+        sections.append(f"<section><h2>{esc(key)}</h2><pre>{esc(value)}</pre></section>")
     else:
         if len(context) > MAX_CONTEXT_KEYS:
             notes.append(f"context carried {len(context)} entries; the first {MAX_CONTEXT_KEYS} were read")
@@ -667,9 +657,9 @@ def run_step(envelope: dict, deadline: float) -> dict:
     title = _clamp(intent.strip() or "Orizon step report", MAX_TITLE_CHARS)
     document = (
         "<!doctype html><html><head><meta charset='utf-8'>"
-        f"<title>{_safe(title, MAX_TITLE_CHARS)}</title></head><body>"
-        f"<h1>{_safe(title, MAX_TITLE_CHARS)}</h1>"
-        f"<p><strong>Rationale.</strong> {_safe(rationale, 1000)}</p>"
+        f"<title>{esc(title)}</title></head><body>"
+        f"<h1>{esc(title)}</h1>"
+        f"<p><strong>Rationale.</strong> {esc(rationale)}</p>"
         f"{body}</body></html>"
     )
     if len(document) > MAX_FILE_CHARS:
@@ -805,16 +795,6 @@ def build_response(result: dict) -> bytes:
         if isinstance(artifact_out, dict):
             artifact_out.pop("preview_html", None)
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    if len(body) > MAX_RESPONSE_BYTES:
-        files_out = payload.get("artifact")
-        if isinstance(files_out, dict) and isinstance(files_out.get("files"), list):
-            files_out["files"] = [
-                {"path": f["path"], "content": f["content"][:8_000]} for f in files_out["files"][:4]
-            ]
-            payload["critic_violations"] = _notes(
-                list(payload["critic_violations"]) + ["the artifact was truncated to fit the 1 MiB response cap"]
-            )
-        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     return body
 
 
@@ -881,10 +861,7 @@ class DispatchHandler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", ""))
         except ValueError as e:
             raise Refused(411, "Content-Length is missing or not a number") from e
-        if length < 0 or length > MAX_BODY_BYTES:
-            # Checked BEFORE allocating anything. `context` grows with every
-            # prior step in a workflow, so envelopes are genuinely large — but
-            # "large" has a number and "unbounded" does not.
+        if length < 0 or length > MAX_BODY_BYTES:  # checked before allocating anything
             raise Refused(413, f"body of {length} bytes exceeds the {MAX_BODY_BYTES}-byte limit")
         chunks, remaining = [], length
         while remaining > 0:
@@ -896,19 +873,10 @@ class DispatchHandler(BaseHTTPRequestHandler):
         return b"".join(chunks)
 
     def do_GET(self) -> None:
-        """A liveness probe, and a one-glance check of the two settings that
-        are most often wrong."""
-        self._respond(
-            200,
-            json.dumps(
-                {
-                    "ok": True,
-                    "endpoint_url": ENDPOINT_URL,
-                    "network": EXPECTED_NETWORK,
-                    "signature_required": bool(PINNED_SIGNER),
-                }
-            ).encode("utf-8"),
-        )
+        """Liveness, plus the settings that are wrong most often."""
+        config = {"ok": True, "endpoint_url": ENDPOINT_URL, "network": EXPECTED_NETWORK,
+                  "signature_required": bool(PINNED_SIGNER)}
+        self._respond(200, json.dumps(config).encode("utf-8"))
 
     def do_POST(self) -> None:
         # FIRST LINE OF THE HANDLER. Everything after this counts against the
