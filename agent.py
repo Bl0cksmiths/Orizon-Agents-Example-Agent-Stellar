@@ -45,9 +45,12 @@ CONFIGURATION (environment variables, all optional, all safe by default)
                           puts this agent in its loud, unverified mode.
     ORIZON_NETWORK        `testnet` or `public`. Must match `network` in the
                           envelope. Default `testnet`.
-    ORIZON_HOST           Listen address. Default 127.0.0.1 — bind to
-                          127.0.0.1 and put TLS in front; see `main`.
-    ORIZON_PORT           Listen port. Default 8787.
+    PORT                  Set by Render, Fly and Heroku. When present it wins
+                          over ORIZON_PORT and switches the default bind
+                          address to 0.0.0.0. You never set this by hand.
+    ORIZON_PORT           Listen port when PORT is absent. Default 8787.
+    ORIZON_HOST           Listen address. Defaults to 0.0.0.0 on a platform
+                          (PORT is set) and 127.0.0.1 on a laptop.
     ORIZON_MAX_SKEW       Accepted clock skew on `ts`, seconds. Default 300,
                           which is what the operator doc specifies.
     ORIZON_MAX_BODY       Largest request body accepted, bytes. Default 8 MiB.
@@ -141,8 +144,19 @@ def _env_int(name: str, default: int) -> int:
 ENDPOINT_URL = _env("ORIZON_ENDPOINT_URL", "http://127.0.0.1:8787/dispatch")
 PINNED_SIGNER = _env("ORIZON_SIGNER", "")
 EXPECTED_NETWORK = _env("ORIZON_NETWORK", "testnet")
-LISTEN_HOST = _env("ORIZON_HOST", "127.0.0.1")
-LISTEN_PORT = _env_int("ORIZON_PORT", 8787)
+# PORT is the PaaS convention: Render, Fly and Heroku inject it and route to
+# whatever the process binds. An operator never sets it by hand, so when it is
+# present it is the platform speaking and it WINS over our own variable —
+# reading only ORIZON_PORT means the platform's port is ignored and every
+# dispatch fails as `no_connection` against a service that looks healthy.
+#
+# Its presence is also how we tell a platform from a laptop, which is what
+# picks the bind address. A PaaS routes to the container's public interface, so
+# 127.0.0.1 there means unreachable; on a laptop it means the only thing
+# exposed is whatever proxy you put in front. Hence 0.0.0.0 when PORT is set.
+_PLATFORM_PORT = _env("PORT", "")
+LISTEN_PORT = _env_int("PORT", 8787) if _PLATFORM_PORT else _env_int("ORIZON_PORT", 8787)
+LISTEN_HOST = _env("ORIZON_HOST", "0.0.0.0" if _PLATFORM_PORT else "127.0.0.1")
 MAX_SKEW_SECONDS = _env_int("ORIZON_MAX_SKEW", 300)
 # Bounded before a single byte is read. `context` carries the output of every
 # prior step in the workflow, so a legitimate envelope can be large — but
@@ -968,6 +982,12 @@ class DispatchHandler(BaseHTTPRequestHandler):
         # deadline, and the orchestrator's clock has already been running since
         # before it connected.
         started = time.monotonic()
+        # No path check, deliberately. The signature is rebuilt from the
+        # CONFIGURED ORIZON_ENDPOINT_URL and never from the request, so the path
+        # this arrived on is irrelevant to whether we trust it. Gating on
+        # `/dispatch` would only turn "I bound the URL without its path" — the
+        # most common binding mistake — into a 404 that looks like the service
+        # is down rather than misconfigured.
         dispatch_id = None
         try:
             raw_body = self._read_body()
