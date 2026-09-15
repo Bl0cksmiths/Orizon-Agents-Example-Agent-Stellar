@@ -61,9 +61,13 @@ non-empty string; everything else is optional but see
 you decide to omit it.
 
 With no `.env` present the agent accepts an unsigned envelope, which is what
-makes that curl work. Setting `ORIZON_REQUIRE_SIGNATURE=true` — the deployed
-default in [`render.yaml`](render.yaml) — makes it refuse one. Leave it off
-locally, leave it on in production, and never invert that.
+makes that curl work — and warns on every request while it does.
+
+There is no separate "require signature" switch, deliberately: the policy
+follows from `ORIZON_SIGNER`. Leave it empty and unsigned requests are accepted;
+pin a signer and they are refused. Once you know Orizon holds a key, accepting
+an unsigned request would make pinning decorative, so the two cannot drift
+apart. Pin the signer before you go live.
 
 ---
 
