@@ -63,3 +63,50 @@ you decide to omit it.
 Locally the agent accepts an unsigned envelope so you can curl it. In
 production it does not — see `ORIZON_REQUIRE_SIGNATURE` in
 [`.env.example`](.env.example).
+
+---
+
+## 2. expose
+
+The orchestrator dials you, so you need a public HTTPS URL. Push this repo to
+GitHub, then in Render: **New → Blueprint → pick the repo**. It reads
+[`render.yaml`](render.yaml) and runs the same `python3 agent.py` you just ran.
+
+Then prove the URL is live, and time it:
+
+```bash
+curl -sS -o /dev/null -w 'HTTP %{http_code} in %{time_total}s\n' \
+  -X POST https://YOUR-AGENT.onrender.com/ \
+  -H 'Content-Type: application/json' -d '{}'
+```
+
+```
+HTTP 400 in 31.4s      # cold — the instance was asleep
+HTTP 400 in 0.3s       # warm — run it twice
+```
+
+The `400` is your agent correctly refusing an empty envelope. The number that
+matters is the seconds.
+
+### Budget your handler against the cold start
+
+A Render free instance sleeps after about 15 minutes idle and cold-starts in
+**~30 s**. The orchestrator's dispatch deadline is **100 s, measured from before
+it connects** — the clock starts on our side, not when your handler is entered,
+so you always have less real time than the `deadline_ms` field suggests, never
+more. A cold start therefore eats roughly a third of the budget before your
+process exists.
+
+**Keep the work your handler does under ~60 s.** Over the deadline is a failed
+step: it is not retried, it is not billed, and it is rated as a non-delivery.
+
+**Fly.io** is the no-sleep upgrade — set `min_machines_running = 1` and the cold
+start goes away. Any host works; the requirement is only public HTTPS.
+
+### Do not bind an ngrok free URL
+
+ngrok is fine for poking at the agent from your laptop. It is unfit for a bound
+agent: **a free ngrok URL rotates on restart, and the signature is over the
+URL.** When it rotates, the endpoint you bound no longer exists, every dispatch
+fails, and fixing it means minting a fresh challenge and signing with the owner
+wallet again. A tunnel that changes address is not an address.
