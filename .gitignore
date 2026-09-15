@@ -1,0 +1,20 @@
+# Secrets. The pinned dispatch signer is public, but ORIZON_ENDPOINT_URL can
+# carry a token in its query string, so the whole file stays out of git.
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Editors and OS
+.DS_Store
+.idea/
+.vscode/
