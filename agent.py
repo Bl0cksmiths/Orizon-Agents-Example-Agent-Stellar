@@ -8,42 +8,34 @@ Orizon's orchestrator plans a buyer's workflow, picks an agent for each step,
 and POSTs that step as a JSON envelope to the HTTPS endpoint its operator
 bound. This file is the other side of that POST: a stdlib HTTP server that
 proves the request came from Orizon, works inside the budget it was given, and
-answers in the shape the orchestrator accepts. Read it top to bottom.
-
-It is a STARTING POINT, not a framework. Replace `run_step`; keep the rest.
+answers in the shape the orchestrator accepts. Read it top to bottom. It is a
+STARTING POINT, not a framework — replace `run_step` and keep the rest.
 
 PyNaCl is the only dependency. `stellar-sdk` would give us
 `Keypair.verify_message` in one line and cost seven transitive packages and
-~12 MB to do it — and every dependency is a chance for your environment to
-differ from ours, in a service whose job is to be correct at 3am. The SDK is
-itself a thin wrapper over PyNaCl here, so we call PyNaCl directly and write
-the two pieces of framing by hand: the SEP-53 message hash and the strkey
-decode. Twenty lines between them, and having them visible teaches what a `G…`
-address and a Stellar signature actually are.
+~12 MB to do it, and every dependency is a chance for your environment to
+differ from ours. The SDK is itself a thin wrapper over PyNaCl here, so we call
+PyNaCl directly and write the two pieces of framing by hand — the SEP-53
+message hash and the strkey decode. Twenty lines between them, and having them
+visible teaches what a `G…` address and a Stellar signature actually are.
 
-No secrets live here. This agent verifies signatures and never makes any, so it
-holds no private key and there is nothing in this file worth stealing.
+No secrets live here: this agent verifies signatures and never makes any.
 
-CONFIGURATION (environment variables, all optional, all safe by default)
+CONFIGURATION — environment variables, all optional, all safe by default
 
-    ORIZON_ENDPOINT_URL   The URL you bound with Orizon, EXACTLY as you
-                          registered it. It is part of the signed message, so
-                          a trailing slash or a http/https mismatch here means
-                          every signature fails. Default is the local dev URL.
-    ORIZON_SIGNER         The `G…` address you pinned out of band, from
-                          GET /api/stellar/network → `dispatch_signer`.
-                          Empty (the default) means "not configured yet" and
-                          puts this agent in its loud, unverified mode.
-    ORIZON_NETWORK        `testnet` or `public`. Must match `network` in the
-                          envelope. Default `testnet`.
-    PORT                  Set by Render, Fly and Heroku. When present it wins
-                          over ORIZON_PORT and switches the default bind
-                          address to 0.0.0.0. You never set this by hand.
-    ORIZON_PORT           Listen port when PORT is absent. Default 8787.
-    ORIZON_HOST           Listen address. Defaults to 0.0.0.0 on a platform
-                          (PORT is set) and 127.0.0.1 on a laptop.
-    ORIZON_MAX_SKEW       Accepted clock skew on `ts`, seconds. Default 300,
-                          which is what the operator doc specifies.
+    ORIZON_ENDPOINT_URL  The URL you bound, EXACTLY as registered. It is part
+                         of the signed message, so a trailing slash or an
+                         http/https mismatch makes every signature fail.
+    ORIZON_SIGNER        The `G…` you pinned out of band, from
+                         GET /api/stellar/network → `dispatch_signer`. Empty
+                         (default) is the loud, unverified mode below.
+    ORIZON_NETWORK       `testnet` or `public`; must match `network` in the
+                         envelope. Default `testnet`.
+    PORT                 Set by Render, Fly and Heroku. When present it wins
+                         over ORIZON_PORT and makes the bind address 0.0.0.0.
+    ORIZON_PORT          Listen port when PORT is absent. Default 8787.
+    ORIZON_HOST          Bind address. 0.0.0.0 on a platform, else 127.0.0.1.
+    ORIZON_MAX_SKEW      Accepted clock skew on `ts`. Default 300 s.
 """
 
 from __future__ import annotations
@@ -68,17 +60,11 @@ from nacl.signing import VerifyKey
 logger = logging.getLogger("orizon.agent")
 
 
-# ---------------------------------------------------------------------------
-# The wire contract. These are Orizon's values, not yours — do not tune them.
-# ---------------------------------------------------------------------------
+# ── The wire contract. These are Orizon's values, not yours — do not tune them. ───
 
-# Envelope version we understand. A future `v` we do not recognise is answered,
-# not refused: the fields we read are additive so far, and refusing an envelope
-# we could have served is a failed step we chose for ourselves.
 ENVELOPE_VERSION = 2
-
-# The signed-message format, domain-separated and versioned. A v2 signature
-# would simply stop verifying here rather than being silently accepted.
+# Domain-separated and versioned: a v2 signature simply stops verifying here
+# rather than being silently accepted under the v1 rule.
 SIG_VERSION = "orizon-dispatch:v1"
 
 SIGNATURE_HEADER = "X-Orizon-Signature"
@@ -87,20 +73,18 @@ SIG_VERSION_HEADER = "X-Orizon-Signature-Version"
 SIGNER_HEADER = "X-Orizon-Signer"
 IDEMPOTENCY_HEADER = "Idempotency-Key"
 
-# SEP-53's domain separator. Stellar signs the SHA-256 of this prefix followed
-# by the message, never the message itself, so that a signature over an
-# arbitrary blob can never also be a valid signature over a transaction
-# envelope. Reproducing the framing is the whole of `sep53_message_hash`.
+# SEP-53's domain separator: Stellar signs the SHA-256 of this prefix plus the
+# message, never the message itself, so a signature over an arbitrary blob can
+# never also be a valid signature over a transaction envelope.
 SEP53_PREFIX = b"Stellar Signed Message:\n"
 
-# Orizon streams our response and cuts it off unread past this, which fails the
-# step as `oversize_response`. We clamp ourselves rather than find out.
+# Orizon streams our response and cuts it off unread past this, failing the
+# step as `oversize_response`.
 MAX_RESPONSE_BYTES = 1_048_576
 
-# The clamps the orchestrator applies to each field it accepts. Applying them
-# here too is not belt-and-braces: a field clamped on their side comes back
-# truncated with a "…[truncated]" marker in the buyer's trace, which reads as
-# sloppiness from your agent. Values from app/agents/workers/external_contract.py.
+# The clamps Orizon applies to each field. Applying them here too is not
+# belt-and-braces: a field clamped on their side arrives in the buyer's trace
+# with a "…[truncated]" marker, which reads as sloppiness from your agent.
 MAX_SUMMARY_CHARS = 2_000
 MAX_TITLE_CHARS = 120
 MAX_FILES = 24
@@ -110,10 +94,7 @@ MAX_NOTES = 16
 MAX_NOTE_CHARS = 500
 
 
-# ---------------------------------------------------------------------------
-# Configuration. Read once at import, from the environment, with defaults that
-# are safe to run as-is on a laptop and obviously wrong to run in production.
-# ---------------------------------------------------------------------------
+# ── Configuration — read once, from the environment ─────────────────────────
 
 
 def _env(name: str, default: str) -> str:
@@ -121,13 +102,11 @@ def _env(name: str, default: str) -> str:
 
 
 def _env_int(name: str, default: int) -> int:
-    raw = _env(name, str(default))
     try:
-        return int(raw)
+        return int(_env(name, str(default)))
     except ValueError:
-        # A typo in an env var must not silently weaken a bound. Say so and use
-        # the default, which is the conservative value in every case here.
-        logger.warning("%s=%r is not an integer — using %d", name, raw, default)
+        # A typo must not silently weaken a bound; the default is conservative.
+        logger.warning("%s is not an integer — using %d", name, default)
         return default
 
 
@@ -135,27 +114,21 @@ ENDPOINT_URL = _env("ORIZON_ENDPOINT_URL", "http://127.0.0.1:8787/dispatch")
 PINNED_SIGNER = _env("ORIZON_SIGNER", "")
 EXPECTED_NETWORK = _env("ORIZON_NETWORK", "testnet")
 # PORT is the PaaS convention: Render, Fly and Heroku inject it and route to
-# whatever the process binds. An operator never sets it by hand, so when it is
-# present it is the platform speaking and it WINS over our own variable —
-# reading only ORIZON_PORT means the platform's port is ignored and every
-# dispatch fails as `no_connection` against a service that looks healthy.
-#
-# Its presence is also how we tell a platform from a laptop, which is what
-# picks the bind address. A PaaS routes to the container's public interface, so
-# 127.0.0.1 there means unreachable; on a laptop it means the only thing
-# exposed is whatever proxy you put in front. Hence 0.0.0.0 when PORT is set.
+# whatever the process binds, and nobody sets it by hand — so when it is
+# present it is the platform speaking and it WINS. Read only ORIZON_PORT and
+# the platform's port is ignored, so every dispatch fails as `no_connection`
+# against a service that looks healthy. Its presence also tells a platform from
+# a laptop, which picks the bind address: a PaaS routes to the container's
+# public interface, so 127.0.0.1 there means unreachable.
 _PLATFORM_PORT = _env("PORT", "")
 LISTEN_PORT = _env_int("PORT", 8787) if _PLATFORM_PORT else _env_int("ORIZON_PORT", 8787)
 LISTEN_HOST = _env("ORIZON_HOST", "0.0.0.0" if _PLATFORM_PORT else "127.0.0.1")
 MAX_SKEW_SECONDS = _env_int("ORIZON_MAX_SKEW", 300)
-# `context` carries every prior step's output, so envelopes are genuinely
-# large — but "large" has a number and "unbounded" does not.
+# "large" has a number; "unbounded" does not.
 MAX_BODY_BYTES = 8 * 1024 * 1024
 
 
-# ---------------------------------------------------------------------------
-# What a `G…` address actually is
-# ---------------------------------------------------------------------------
+# ── What a `G…` address actually is ─────────────────────────────────────────
 
 
 def decode_g_address(address: str) -> bytes:
@@ -232,9 +205,7 @@ def dispatch_message(endpoint_url: str, raw_body: bytes) -> str:
     return f"{SIG_VERSION}:{endpoint_url}:{hashlib.sha256(raw_body).hexdigest()}"
 
 
-# ---------------------------------------------------------------------------
-# Verifying that a request really came from Orizon
-# ---------------------------------------------------------------------------
+# ── Verifying that a request really came from Orizon ────────────────────────
 
 
 class Refused(Exception):
@@ -373,9 +344,7 @@ def verify_dispatch(headers, raw_body: bytes) -> str:
     return VERIFIED
 
 
-# ---------------------------------------------------------------------------
-# Checking the envelope itself
-# ---------------------------------------------------------------------------
+# ── Checking the envelope itself ────────────────────────────────────────────
 
 # A dispatch id is hex from `secrets.token_hex(8)`. Pinning the shape lets the
 # id be a dict key, a log field, or a filename without becoming an injection
@@ -446,9 +415,7 @@ def check_envelope(envelope: object, headers) -> dict:
     return envelope
 
 
-# ---------------------------------------------------------------------------
-# Replay: the same dispatch_id must produce the same answer, not a second run
-# ---------------------------------------------------------------------------
+# ── Replay: the same dispatch_id must produce the same answer, not a second run ───
 
 
 # Orizon retries a dispatch exactly once, and ONLY when the connection never
@@ -488,9 +455,7 @@ def recall(dispatch_id: str) -> bytes | None:
         return _ANSWERED.get(dispatch_id)
 
 
-# ---------------------------------------------------------------------------
-# The deadline
-# ---------------------------------------------------------------------------
+# ── The deadline ────────────────────────────────────────────────────────────
 
 # Fallbacks for a `deadline_ms` that is absent or absurd. Read the envelope's
 # value rather than hard-coding one — it is inside the signed bytes, so it
@@ -529,9 +494,7 @@ def work_deadline(envelope: dict, started: float) -> float:
     return started + max(0.0, (raw / 1000.0) * WORK_FRACTION - RESPONSE_RESERVE_SECONDS)
 
 
-# ---------------------------------------------------------------------------
-# The work. THIS is the part you replace.
-# ---------------------------------------------------------------------------
+# ── The work. THIS is the part you replace. ─────────────────────────────────
 
 
 def _clamp(text: str, limit: int) -> str:
@@ -636,9 +599,7 @@ def run_step(envelope: dict, deadline: float) -> dict:
     return {"summary": summary, "artifact": artifact, "violations": violations, "notes": notes}
 
 
-# ---------------------------------------------------------------------------
-# The response. READ THIS SECTION EVEN IF YOU SKIM THE REST.
-# ---------------------------------------------------------------------------
+# ── The response. READ THIS SECTION EVEN IF YOU SKIM THE REST. ──────────────
 
 
 def _notes(items: list[str]) -> list[str]:
@@ -741,9 +702,7 @@ def build_response(result: dict) -> bytes:
     return body
 
 
-# ---------------------------------------------------------------------------
-# The server
-# ---------------------------------------------------------------------------
+# ── The server ──────────────────────────────────────────────────────────────
 
 
 class DispatchHandler(BaseHTTPRequestHandler):
