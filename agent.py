@@ -240,3 +240,152 @@ def dispatch_message(endpoint_url: str, raw_body: bytes) -> str:
     RECEIVED — see `verify_dispatch`.
     """
     return f"{SIG_VERSION}:{endpoint_url}:{hashlib.sha256(raw_body).hexdigest()}"
+
+
+# ---------------------------------------------------------------------------
+# Verifying that a request really came from Orizon
+# ---------------------------------------------------------------------------
+
+
+class Refused(Exception):
+    """A request we will not run. `status` is the HTTP status to answer with.
+
+    Refusing costs the operator nothing: a non-2xx fails the step as
+    `error_status`, which is not billed. Running a forged step costs you the
+    compute AND puts output you did not author into a buyer's workflow under
+    your agent id. When in doubt, refuse.
+    """
+
+    def __init__(self, status: int, reason: str) -> None:
+        super().__init__(reason)
+        self.status = status
+        self.reason = reason
+
+
+# Verification outcomes, in the order of how much they let you trust the caller.
+VERIFIED = "verified"  # signature checked against the pinned signer
+UNVERIFIED = "unverified"  # accepted without proof — see the policy below
+
+
+def verify_dispatch(headers, raw_body: bytes) -> str:
+    """Decide whether to run this request. Returns VERIFIED or UNVERIFIED,
+    or raises `Refused`.
+
+    `raw_body` MUST be the bytes off the socket, before `json.loads`. This is
+    the single most common way to get this wrong. If you parse first and
+    re-serialize to hash, you are hashing YOUR encoder's output, not Orizon's:
+    Python's `json.dumps` defaults to `ensure_ascii=True` and `", "`
+    separators, while the orchestrator sends
+    `json.dumps(payload, separators=(",", ":"), ensure_ascii=False)`. Those
+    agree byte for byte on pure-ASCII payloads and diverge on the first
+    accented character, emoji or CJK string a buyer types. So the bug passes
+    every test you write, ships, and then fails intermittently in production
+    on exactly the envelopes you cannot reproduce. Hash the raw bytes.
+
+    ── THE UNSIGNED-REQUEST POLICY ────────────────────────────────────────────
+    Orizon signs a dispatch only when the deployment has a dispatch key
+    configured; a deployment without one sends no signature headers at all, and
+    that is not an attack. So there are two states and this agent treats them
+    differently:
+
+      * ORIZON_SIGNER is PINNED  → a signature is REQUIRED. An unsigned request
+        is refused 401. Once you know Orizon holds a key, an unsigned request
+        is either a misconfiguration or someone downgrading you to no
+        authentication at all, and accepting it makes pinning decorative.
+
+      * ORIZON_SIGNER is EMPTY   → unsigned requests are accepted, every one of
+        them logs a WARNING, and the result is marked UNVERIFIED so the rest of
+        the file can decline to do anything expensive. This is the
+        "not configured yet" state, and it is loud on purpose: a silently
+        unauthenticated endpoint is how an agent ends up running strangers'
+        work. Pin a signer. It takes one environment variable.
+
+    Choose the opposite default if you like — the doc says it is your call —
+    but choose it deliberately. What you must NOT do is what the header layout
+    invites, which is the third branch below.
+    """
+    signature_b64 = headers.get(SIGNATURE_HEADER)
+    version = headers.get(SIG_VERSION_HEADER)
+    claimed_signer = headers.get(SIGNER_HEADER)
+    present = [h for h in (signature_b64, version, claimed_signer) if h is not None]
+
+    if not present:
+        if PINNED_SIGNER:
+            raise Refused(401, "unsigned dispatch, and a signer is pinned")
+        logger.warning(
+            "UNSIGNED dispatch accepted: ORIZON_SIGNER is not set, so anyone who can "
+            "reach this endpoint can run this agent. Pin the G-address from "
+            "GET /api/stellar/network -> dispatch_signer."
+        )
+        return UNVERIFIED
+
+    # Some but not all of the three. Never Orizon — it adds the headers as one
+    # dict — so it is a proxy stripping headers or someone probing. A partial
+    # signature is worse than none: it is a claim we cannot check.
+    if len(present) != 3:
+        raise Refused(400, "incomplete signature headers")
+
+    if version != SIG_VERSION:
+        # A version we do not implement. Refuse rather than guess at framing:
+        # verifying v2 bytes with the v1 rule is how a "successful" check ends
+        # up proving nothing.
+        raise Refused(400, f"unsupported signature version {version!r}")
+
+    if not PINNED_SIGNER:
+        # ── THE TRAP ──────────────────────────────────────────────────────────
+        # There is a G-address RIGHT THERE in `claimed_signer`, and verifying
+        # against it would make this branch pass. It would also be worthless.
+        # An attacker generates a keypair, signs their own forged envelope with
+        # it, puts their own public key in X-Orizon-Signer, and every check
+        # succeeds — because you asked the sender who to trust. The header is a
+        # debugging hint: it tells you which key Orizon BELIEVES it used, so a
+        # key rotation shows up as a mismatch instead of a mystery. It is never
+        # an input to the decision.
+        logger.warning(
+            "dispatch carries a signature but ORIZON_SIGNER is not set, so it was NOT "
+            "verified. The X-Orizon-Signer header is not a substitute: anyone can set it. "
+            "Pin the signer you fetched out of band."
+        )
+        return UNVERIFIED
+
+    if claimed_signer != PINNED_SIGNER:
+        # Logged, not merely refused, and this is the one place the header
+        # earns its keep: "signed by a key that is not the one I pinned" is a
+        # key rotation nine times out of ten, and you want to see it named.
+        logger.warning(
+            "dispatch signed by %s but %s is pinned — refusing. If Orizon rotated its "
+            "dispatch key, re-fetch GET /api/stellar/network and update ORIZON_SIGNER.",
+            claimed_signer,
+            PINNED_SIGNER,
+        )
+        raise Refused(401, "signer does not match the pinned signer")
+
+    try:
+        signature = base64.b64decode(signature_b64, validate=True)
+    except (binascii.Error, ValueError) as e:
+        raise Refused(400, "signature is not valid base64") from e
+    if len(signature) != 64:
+        raise Refused(400, "signature is not 64 bytes")
+
+    try:
+        signer_key = decode_g_address(PINNED_SIGNER)
+    except ValueError as e:
+        # OUR configuration is broken, not their request. 500 is honest: fixing
+        # it is our job, and a 401 here would send an operator hunting for a
+        # problem at Orizon's end that does not exist.
+        raise Refused(500, f"ORIZON_SIGNER is not a usable address ({e})") from e
+
+    # The URL comes from OUR configuration. Never from the request — not from a
+    # Host header, not from `self.path`, not from a field in the body. An
+    # attacker controls all three, and a verifier that rebuilds the message out
+    # of attacker-supplied pieces verifies that the attacker is self-consistent.
+    message = dispatch_message(ENDPOINT_URL, raw_body)
+    try:
+        VerifyKey(signer_key).verify(sep53_message_hash(message), signature)
+    except BadSignatureError as e:
+        raise Refused(
+            401,
+            "signature does not verify — if this is every request, check that "
+            "ORIZON_ENDPOINT_URL is byte-identical to the URL you bound",
+        ) from e
+    return VERIFIED
