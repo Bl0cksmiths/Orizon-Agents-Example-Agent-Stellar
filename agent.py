@@ -492,100 +492,42 @@ def check_envelope(envelope: object, headers) -> dict:
 # ---------------------------------------------------------------------------
 
 
-class ReplayLedger:
-    """Remembers what we answered for each `dispatch_id`.
-
-    Orizon retries a dispatch exactly once, and ONLY when the connection never
-    established — so in the case it retries, you never ran. But the retry
-    carries the SAME `dispatch_id`, which tells you something more useful than
-    "you may ignore this": it tells you the id is the orchestrator's unit of
-    work, and that answering it twice with two different results is a bug you
-    are allowed to have but should not.
-
-    So the rule is REPLAY, not reject. Returning the stored response is
-    correct and free; returning an error for a duplicate turns a retry that was
-    supposed to rescue a failed connection into a failed step.
-
-    Bounded, because an id is attacker-supplied once you accept unsigned
-    requests: `capacity` entries, oldest evicted first. Eviction is safe here —
-    a retry follows within seconds, so an entry old enough to evict is an entry
-    no retry will ask for.
-
-    IN MEMORY, and therefore LOST ON RESTART. That is acceptable for this agent
-    because a retry only happens when nothing ran, so a lost entry costs one
-    duplicate execution of work that was never performed. If your agent does
-    something that must not happen twice — charges a card, sends an email,
-    writes to a shared bucket — this belongs in the same durable store as the
-    side effect, committed in the same transaction. An in-memory ledger in
-    front of an irreversible action is a comfort, not a guarantee.
-    """
-
-    def __init__(self, capacity: int = 1024) -> None:
-        self._capacity = capacity
-        self._lock = threading.Lock()
-        # dispatch_id -> (status, body) once finished, or None while running.
-        self._entries: OrderedDict[str, tuple[int, bytes] | None] = OrderedDict()
-        # Signalled whenever any entry completes, so a concurrent duplicate can
-        # wait for the first one instead of racing it.
-        self._finished = threading.Condition(self._lock)
-
-    def claim(self, dispatch_id: str, wait_seconds: float) -> tuple[int, bytes] | None:
-        """Claim the right to run `dispatch_id`, or return the prior response.
-
-        None means "you run it, and you must call `complete`". A tuple means it
-        has already been answered and this is the answer — byte-identical,
-        because it is literally the same bytes.
-
-        The in-flight case (a duplicate arriving while the first is still
-        running) waits rather than running in parallel. The server is threaded,
-        so two copies of one step CAN overlap; letting them would mean two runs
-        of the buyer's work for one billed step, and a coin flip over which
-        result the orchestrator keeps.
-        """
-        deadline = time.monotonic() + wait_seconds
-        with self._lock:
-            while True:
-                if dispatch_id in self._entries:
-                    stored = self._entries[dispatch_id]
-                    if stored is not None:
-                        self._entries.move_to_end(dispatch_id)
-                        logger.info("dispatch %s replayed from the ledger", dispatch_id)
-                        return stored
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        # Still running and we are out of budget. Take it over
-                        # rather than answer nothing: a second run is wasteful,
-                        # a timeout is a failed step and a 20/100 rating.
-                        logger.warning("dispatch %s still in flight — running it again", dispatch_id)
-                        return None
-                    self._finished.wait(remaining)
-                    continue
-                self._entries[dispatch_id] = None
-                while len(self._entries) > self._capacity:
-                    self._entries.popitem(last=False)
-                return None
-
-    def complete(self, dispatch_id: str, status: int, body: bytes) -> None:
-        """Store what we answered, and wake anyone waiting on it."""
-        with self._lock:
-            self._entries[dispatch_id] = (status, body)
-            self._entries.move_to_end(dispatch_id)
-            self._finished.notify_all()
-
-    def abandon(self, dispatch_id: str) -> None:
-        """Drop a claim we never completed, so a retry is not stuck waiting.
-
-        Called when the handler raises. The step is not recorded as answered —
-        there is no answer — so a retry gets a fresh run, which is what you
-        want after a crash mid-step.
-        """
-        with self._lock:
-            if self._entries.get(dispatch_id) is None:
-                self._entries.pop(dispatch_id, None)
-            self._finished.notify_all()
+# Orizon retries a dispatch exactly once, and ONLY when the connection never
+# established — so in the case it retries, you never ran. But the retry carries
+# the SAME `dispatch_id`, which says something more useful than "you may ignore
+# this": the id is the orchestrator's unit of work, and answering it twice with
+# two different results is a bug.
+#
+# So the rule is REPLAY, not reject. Returning the stored bytes is correct and
+# free; answering an error for a duplicate turns a retry that was meant to
+# rescue a failed connection into a failed step.
+#
+# Bounded, because a `dispatch_id` is attacker-supplied the moment you accept
+# unsigned requests. Oldest evicted first, which is safe: a retry follows within
+# seconds, so an entry old enough to evict is one no retry will ask for.
+#
+# IN MEMORY, and therefore LOST ON RESTART. Fine here, because a retry only
+# happens when nothing ran. If your agent does something that must not happen
+# twice — charges a card, sends mail, writes to a shared bucket — this belongs
+# in the same durable store as the side effect, written in the same
+# transaction. An in-memory ledger in front of an irreversible action is a
+# comfort, not a guarantee.
+_ANSWERED: OrderedDict[str, bytes] = OrderedDict()
+_ANSWERED_LOCK = threading.Lock()
+_ANSWERED_CAPACITY = 1024
 
 
-LEDGER = ReplayLedger()
+def remember(dispatch_id: str, body: bytes) -> None:
+    with _ANSWERED_LOCK:
+        _ANSWERED[dispatch_id] = body
+        _ANSWERED.move_to_end(dispatch_id)
+        while len(_ANSWERED) > _ANSWERED_CAPACITY:
+            _ANSWERED.popitem(last=False)
+
+
+def recall(dispatch_id: str) -> bytes | None:
+    with _ANSWERED_LOCK:
+        return _ANSWERED.get(dispatch_id)
 
 
 # ---------------------------------------------------------------------------
@@ -1011,22 +953,18 @@ class DispatchHandler(BaseHTTPRequestHandler):
             dispatch_id = envelope["dispatch_id"]
             budget = Budget(envelope, started)
 
-            # Replay before running. Half the budget is a generous wait for an
-            # in-flight twin and still leaves time to answer if it never
-            # finishes.
-            prior = LEDGER.claim(dispatch_id, wait_seconds=max(0.0, budget.remaining() / 2))
+            # Replay before running. Orizon never sends two copies of one
+            # dispatch concurrently — it retries only after a connection failed,
+            # sequentially — so a plain lookup is enough and a lock around the
+            # whole step is not.
+            prior = recall(dispatch_id)
             if prior is not None:
-                self._respond(*prior)
+                logger.info("dispatch %s replayed from the ledger", dispatch_id)
+                self._respond(200, prior)
                 return
 
-            try:
-                result = run_step(envelope, budget)
-                body = build_response(result)
-            except Exception:
-                LEDGER.abandon(dispatch_id)
-                raise
-
-            LEDGER.complete(dispatch_id, 200, body)
+            body = build_response(run_step(envelope, budget))
+            remember(dispatch_id, body)
             logger.info(
                 "dispatch %s (%s) answered in %.2fs, %d bytes",
                 dispatch_id,
@@ -1043,8 +981,6 @@ class DispatchHandler(BaseHTTPRequestHandler):
             # than a 200 carrying an apology: that would be billed AND rated
             # 20/100 for delivering nothing checkable. Never dress a failure up
             # as a delivery.
-            if dispatch_id:
-                LEDGER.abandon(dispatch_id)
             logger.exception("dispatch failed")
             self._refuse(500, "internal error")
 
