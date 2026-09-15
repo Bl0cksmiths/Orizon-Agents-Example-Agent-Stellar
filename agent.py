@@ -730,7 +730,7 @@ def run_step(envelope: dict, budget: Budget) -> dict:
         violations.append("the generated document exceeded the size limit and was cut")
 
     summary = _clamp(
-        (f"Reported on {len(sections)} prior step(s) for: {intent.strip()}" if intent.strip() else "Produced a step report.")
+        (f"Reported on {len(sections)} prior step(s) for: {intent.strip()}." if intent.strip() else "Produced a step report.")
         + (" Partial: the deadline was reached." if truncated else ""),
         MAX_SUMMARY_CHARS,
     )
@@ -1050,7 +1050,7 @@ def main() -> None:
     # alternative is a shutdown that hangs on a 100-second budget.
     server.daemon_threads = True
     logger.info(
-        "listening on http://%s:%d — signing in as %s, network %s, signature %s",
+        "listening on http://%s:%d — bound endpoint %s, network %s, signature %s",
         LISTEN_HOST,
         LISTEN_PORT,
         ENDPOINT_URL,
