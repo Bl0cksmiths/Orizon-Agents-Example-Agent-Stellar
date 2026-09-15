@@ -60,9 +60,10 @@ non-empty string; everything else is optional but see
 [the reputation warning](#the-one-mistake-that-destroys-your-reputation) before
 you decide to omit it.
 
-Locally the agent accepts an unsigned envelope so you can curl it. In
-production it does not — see `ORIZON_REQUIRE_SIGNATURE` in
-[`.env.example`](.env.example).
+With no `.env` present the agent accepts an unsigned envelope, which is what
+makes that curl work. Setting `ORIZON_REQUIRE_SIGNATURE=true` — the deployed
+default in [`render.yaml`](render.yaml) — makes it refuse one. Leave it off
+locally, leave it on in production, and never invert that.
 
 ---
 
