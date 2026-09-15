@@ -389,3 +389,85 @@ def verify_dispatch(headers, raw_body: bytes) -> str:
             "ORIZON_ENDPOINT_URL is byte-identical to the URL you bound",
         ) from e
     return VERIFIED
+
+
+# ---------------------------------------------------------------------------
+# Checking the envelope itself
+# ---------------------------------------------------------------------------
+
+# A dispatch id is hex from `secrets.token_hex(8)`. Pinning the shape means the
+# id can be used as a dict key, a log field and (if you persist results) a
+# filename without any of those becoming an injection point. Anything else is
+# refused rather than sanitised: sanitising invents a second id space where two
+# different inputs can collapse onto one entry, and an id collision in a replay
+# ledger returns one buyer's output to another.
+_DISPATCH_ID_RE = re.compile(r"\A[0-9a-f]{8,64}\Z")
+
+
+def _text(envelope: dict, key: str, limit: int = 20_000) -> str:
+    """One string field out of the envelope, clamped, never trusted.
+
+    Everything the buyer typed and everything a previous operator's agent
+    produced arrives through fields like these. A non-string is coerced to ""
+    rather than raising: the envelope's shape is Orizon's promise, but this
+    function is the boundary where that promise stops being assumed.
+    """
+    value = envelope.get(key)
+    return value[:limit] if isinstance(value, str) else ""
+
+
+def check_envelope(envelope: object, headers) -> dict:
+    """Validate the decoded envelope, or raise `Refused`. Returns it unchanged.
+
+    Ordered cheapest-first, and all of it runs AFTER the signature check, so an
+    unsigned caller cannot use these branches to probe what we accept.
+    """
+    if not isinstance(envelope, dict):
+        raise Refused(400, "body is not a JSON object")
+
+    dispatch_id = envelope.get("dispatch_id")
+    if not isinstance(dispatch_id, str) or not _DISPATCH_ID_RE.match(dispatch_id):
+        raise Refused(400, "dispatch_id is missing or not lowercase hex")
+
+    # The Idempotency-Key header is OUTSIDE the signed bytes; `dispatch_id` is
+    # inside them. Requiring them to be equal is what stops a proxy — or anyone
+    # in the path — from rewriting the header to split one dispatch into two
+    # ledger entries, or to collapse two into one. They cannot touch the body
+    # copy without invalidating the signature, so pinning the header to it
+    # drags the header under the signature's protection for free.
+    if headers.get(IDEMPOTENCY_HEADER) != dispatch_id:
+        raise Refused(400, "Idempotency-Key does not match dispatch_id")
+
+    # Network is inside the signed bytes for a reason worth understanding: the
+    # SEP-53 preimage carries no network passphrase, unlike Stellar transaction
+    # signing. A testnet dispatch and a mainnet dispatch are therefore framed
+    # identically, and `network` is the ONLY thing separating them. Without this
+    # check, a testnet envelope — cheap to obtain — replays against a mainnet
+    # agent and settles with real money behind it.
+    network = envelope.get("network")
+    if network != EXPECTED_NETWORK:
+        raise Refused(400, f"network {network!r} is not {EXPECTED_NETWORK!r}")
+
+    # Freshness. A signature is valid forever; `ts` is what gives it an expiry.
+    # 300 s is the window the operator doc specifies — wide because it has to
+    # absorb clock skew on both machines, which is also why it cannot be
+    # narrowed into a useful budget. Bounding replay is the ledger's job, not
+    # this check's; this one bounds how long a CAPTURED envelope stays usable.
+    ts = envelope.get("ts")
+    if not isinstance(ts, int) or isinstance(ts, bool):
+        raise Refused(400, "ts is missing or not an integer")
+    skew = abs(time.time() - ts)
+    if skew > MAX_SKEW_SECONDS:
+        raise Refused(
+            400,
+            f"ts is {skew:.0f}s away from our clock (limit {MAX_SKEW_SECONDS}s) — "
+            "check NTP on this host before blaming the sender",
+        )
+
+    version = envelope.get("v")
+    if isinstance(version, int) and version > ENVELOPE_VERSION:
+        # Answered, not refused: every field we read has been additive so far,
+        # and refusing an envelope we could have served is a failed step and a
+        # 20/100 rating we chose for ourselves. Logged so you find out.
+        logger.warning("envelope v%s is newer than v%d — serving it anyway", version, ENVELOPE_VERSION)
+    return envelope
