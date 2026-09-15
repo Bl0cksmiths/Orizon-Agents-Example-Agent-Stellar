@@ -471,3 +471,104 @@ def check_envelope(envelope: object, headers) -> dict:
         # 20/100 rating we chose for ourselves. Logged so you find out.
         logger.warning("envelope v%s is newer than v%d — serving it anyway", version, ENVELOPE_VERSION)
     return envelope
+
+
+# ---------------------------------------------------------------------------
+# Replay: the same dispatch_id must produce the same answer, not a second run
+# ---------------------------------------------------------------------------
+
+
+class ReplayLedger:
+    """Remembers what we answered for each `dispatch_id`.
+
+    Orizon retries a dispatch exactly once, and ONLY when the connection never
+    established — so in the case it retries, you never ran. But the retry
+    carries the SAME `dispatch_id`, which tells you something more useful than
+    "you may ignore this": it tells you the id is the orchestrator's unit of
+    work, and that answering it twice with two different results is a bug you
+    are allowed to have but should not.
+
+    So the rule is REPLAY, not reject. Returning the stored response is
+    correct and free; returning an error for a duplicate turns a retry that was
+    supposed to rescue a failed connection into a failed step.
+
+    Bounded, because an id is attacker-supplied once you accept unsigned
+    requests: `capacity` entries, oldest evicted first. Eviction is safe here —
+    a retry follows within seconds, so an entry old enough to evict is an entry
+    no retry will ask for.
+
+    IN MEMORY, and therefore LOST ON RESTART. That is acceptable for this agent
+    because a retry only happens when nothing ran, so a lost entry costs one
+    duplicate execution of work that was never performed. If your agent does
+    something that must not happen twice — charges a card, sends an email,
+    writes to a shared bucket — this belongs in the same durable store as the
+    side effect, committed in the same transaction. An in-memory ledger in
+    front of an irreversible action is a comfort, not a guarantee.
+    """
+
+    def __init__(self, capacity: int = 1024) -> None:
+        self._capacity = capacity
+        self._lock = threading.Lock()
+        # dispatch_id -> (status, body) once finished, or None while running.
+        self._entries: OrderedDict[str, tuple[int, bytes] | None] = OrderedDict()
+        # Signalled whenever any entry completes, so a concurrent duplicate can
+        # wait for the first one instead of racing it.
+        self._finished = threading.Condition(self._lock)
+
+    def claim(self, dispatch_id: str, wait_seconds: float) -> tuple[int, bytes] | None:
+        """Claim the right to run `dispatch_id`, or return the prior response.
+
+        None means "you run it, and you must call `complete`". A tuple means it
+        has already been answered and this is the answer — byte-identical,
+        because it is literally the same bytes.
+
+        The in-flight case (a duplicate arriving while the first is still
+        running) waits rather than running in parallel. The server is threaded,
+        so two copies of one step CAN overlap; letting them would mean two runs
+        of the buyer's work for one billed step, and a coin flip over which
+        result the orchestrator keeps.
+        """
+        deadline = time.monotonic() + wait_seconds
+        with self._lock:
+            while True:
+                if dispatch_id in self._entries:
+                    stored = self._entries[dispatch_id]
+                    if stored is not None:
+                        self._entries.move_to_end(dispatch_id)
+                        logger.info("dispatch %s replayed from the ledger", dispatch_id)
+                        return stored
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        # Still running and we are out of budget. Take it over
+                        # rather than answer nothing: a second run is wasteful,
+                        # a timeout is a failed step and a 20/100 rating.
+                        logger.warning("dispatch %s still in flight — running it again", dispatch_id)
+                        return None
+                    self._finished.wait(remaining)
+                    continue
+                self._entries[dispatch_id] = None
+                while len(self._entries) > self._capacity:
+                    self._entries.popitem(last=False)
+                return None
+
+    def complete(self, dispatch_id: str, status: int, body: bytes) -> None:
+        """Store what we answered, and wake anyone waiting on it."""
+        with self._lock:
+            self._entries[dispatch_id] = (status, body)
+            self._entries.move_to_end(dispatch_id)
+            self._finished.notify_all()
+
+    def abandon(self, dispatch_id: str) -> None:
+        """Drop a claim we never completed, so a retry is not stuck waiting.
+
+        Called when the handler raises. The step is not recorded as answered —
+        there is no answer — so a retry gets a fresh run, which is what you
+        want after a crash mid-step.
+        """
+        with self._lock:
+            if self._entries.get(dispatch_id) is None:
+                self._entries.pop(dispatch_id, None)
+            self._finished.notify_all()
+
+
+LEDGER = ReplayLedger()
