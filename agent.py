@@ -563,27 +563,18 @@ WORK_FRACTION = 0.5
 RESPONSE_RESERVE_SECONDS = 1.0
 
 
-class Budget:
-    """The wall clock for one dispatch, started as early as we can start it."""
+def work_deadline(envelope: dict, started: float) -> float:
+    """The monotonic instant by which `run_step` must stop working.
 
-    def __init__(self, envelope: dict, started: float) -> None:
-        raw = envelope.get("deadline_ms")
-        if not isinstance(raw, int) or isinstance(raw, bool) or not (MIN_DEADLINE_MS <= raw <= MAX_DEADLINE_MS):
-            logger.warning("deadline_ms=%r is unusable — assuming %d ms", raw, DEFAULT_DEADLINE_MS)
-            raw = DEFAULT_DEADLINE_MS
-        self.total_seconds = raw / 1000.0
-        self.started = started
-        self.work_deadline = started + max(0.0, self.total_seconds * WORK_FRACTION - RESPONSE_RESERVE_SECONDS)
-
-    def remaining(self) -> float:
-        """Seconds of WORK time left. Negative once the budget is gone."""
-        return self.work_deadline - time.monotonic()
-
-    def exhausted(self) -> bool:
-        return self.remaining() <= 0
-
-    def elapsed(self) -> float:
-        return time.monotonic() - self.started
+    `started` is taken on the first line of the handler; everything after it
+    counts, and the orchestrator's clock has been running since before it
+    connected.
+    """
+    raw = envelope.get("deadline_ms")
+    if not isinstance(raw, int) or isinstance(raw, bool) or not (MIN_DEADLINE_MS <= raw <= MAX_DEADLINE_MS):
+        logger.warning("deadline_ms=%r is unusable — assuming %d ms", raw, DEFAULT_DEADLINE_MS)
+        raw = DEFAULT_DEADLINE_MS
+    return started + max(0.0, (raw / 1000.0) * WORK_FRACTION - RESPONSE_RESERVE_SECONDS)
 
 
 # ---------------------------------------------------------------------------
@@ -625,16 +616,16 @@ def _safe(value: object, limit: int = 400) -> str:
 MAX_CONTEXT_KEYS = 12
 
 
-def run_step(envelope: dict, budget: Budget) -> dict:
-    """Do the work, inside `budget`, and return the pieces of the response.
+def run_step(envelope: dict, deadline: float) -> dict:
+    """Do the work, finishing before `deadline`, and return the response parts.
 
     The reference implementation writes a small HTML report of the step it was
     given — enough to be a real artifact rather than a placeholder — and
     reviews its own output. Replace the body; keep the shape:
 
-      * check `budget.exhausted()` between units of work, not only at the top,
+      * check the clock between units of work, not only at the top,
       * never let one unit run unbounded (if yours calls a model or an API,
-        pass `budget.remaining()` down as ITS timeout),
+        pass the time left down as ITS timeout),
       * on running out, stop and report what you have.
 
     A partial result is a delivered result. Being cut off is not.
@@ -655,7 +646,7 @@ def run_step(envelope: dict, budget: Budget) -> dict:
     # One "unit of work" per prior step in the context, with a budget check
     # before each. Real work goes here; the discipline is what matters.
     for index, (key, value) in enumerate(sorted(context.items())[:MAX_CONTEXT_KEYS]):
-        if budget.exhausted():
+        if time.monotonic() >= deadline:
             truncated = True
             violations.append(
                 f"ran out of time after {index} of {min(len(context), MAX_CONTEXT_KEYS)} inputs; "
@@ -670,7 +661,7 @@ def run_step(envelope: dict, budget: Budget) -> dict:
     if not context:
         notes.append("no prior step output was supplied, so this step had nothing to build on")
     if not truncated:
-        notes.append(f"completed in {budget.elapsed():.2f}s of a {budget.total_seconds:.0f}s budget")
+        notes.append(f"finished with {deadline - time.monotonic():.1f}s of working time to spare")
 
     body = "".join(sections) or "<p>No prior step output was supplied.</p>"
     title = _clamp(intent.strip() or "Orizon step report", MAX_TITLE_CHARS)
@@ -951,7 +942,7 @@ class DispatchHandler(BaseHTTPRequestHandler):
 
             envelope = check_envelope(envelope, self.headers)
             dispatch_id = envelope["dispatch_id"]
-            budget = Budget(envelope, started)
+            deadline = work_deadline(envelope, started)
 
             # Replay before running. Orizon never sends two copies of one
             # dispatch concurrently — it retries only after a connection failed,
@@ -963,13 +954,13 @@ class DispatchHandler(BaseHTTPRequestHandler):
                 self._respond(200, prior)
                 return
 
-            body = build_response(run_step(envelope, budget))
+            body = build_response(run_step(envelope, deadline))
             remember(dispatch_id, body)
             logger.info(
                 "dispatch %s (%s) answered in %.2fs, %d bytes",
                 dispatch_id,
                 trust,
-                budget.elapsed(),
+                time.monotonic() - started,
                 len(body),
             )
             self._respond(200, body)
