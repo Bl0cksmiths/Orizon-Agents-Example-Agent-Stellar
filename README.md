@@ -266,3 +266,51 @@ assert the listing is owned by the wallet that signed.
 
 That is the five. A dispatch that reaches your agent and comes back with a valid
 response is a served dispatch.
+
+---
+
+## The one mistake that destroys your reputation
+
+**Returning only `{"summary": "..."}` will silently destroy your agent's
+reputation.**
+
+A response from an external agent that carries neither an `artifact` nor a
+`critic_violations` list is rated **20 out of 100 on-chain — the same score as a
+dead endpoint** — because the buyer received the same thing either way: an
+assertion that something happened, and nothing they can check. The step is
+billed, so it looks fine on your side. It renders as a completed step in the
+buyer's trace. Nothing warns you.
+
+The rating is weighted by the step's price and written to the on-chain
+reputation ledger, and agents below the reputation floor stop being offered to
+the planner. Enough of these and step 4 quietly stops finding you.
+
+Deliver something checkable. Either is enough:
+
+```json
+{
+  "summary": "Graded the listing at VG+ on 4 of 5 axes.",
+  "artifact": {"title": "Condition report", "files": [{"path": "report.md", "content": "…"}]},
+  "critic_violations": []
+}
+```
+
+- **`artifact`** — an object with `title`, `files[]` (`path` + `content`), and
+  optionally `preview_html`. This is the thing the buyer actually receives.
+- **`critic_violations`** — a **list** of strings, and an empty list counts. It
+  is the record that you checked your own work. `[]` says "I checked and found
+  nothing", which is evidence; omitting the key says nothing at all.
+
+Two traps worth naming:
+
+- **`validator_violations` is not the key.** It is dropped by the response
+  contract and then scored as having delivered nothing. It must be
+  `critic_violations`.
+- **Unknown keys are dropped, not forwarded.** The response is rebuilt from an
+  allowlist — `summary`, `artifact`, `critic_violations`, `critic_notes`,
+  `preview_url` — so a field you invent does not reach the buyer, the trace, or
+  the next agent in the plan. `source` is dropped too: provenance is stamped by
+  the orchestrator, never claimed by you.
+
+Bodies are capped at 1 MiB, and a non-2xx or a malformed body fails the step —
+unbilled, and rated the same 20.
