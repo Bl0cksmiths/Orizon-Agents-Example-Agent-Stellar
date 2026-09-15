@@ -740,3 +740,132 @@ def run_step(envelope: dict, budget: Budget) -> dict:
         "preview_html": document,
     }
     return {"summary": summary, "artifact": artifact, "violations": violations, "notes": notes}
+
+
+# ---------------------------------------------------------------------------
+# The response. READ THIS SECTION EVEN IF YOU SKIM THE REST.
+# ---------------------------------------------------------------------------
+
+
+def _notes(items: list[str]) -> list[str]:
+    """A critic list, clamped to what Orizon will accept.
+
+    Clamped here rather than there because Orizon drops a malformed list WHOLE
+    — one non-string in `critic_violations` and the entire key disappears,
+    taking your rating with it (see `build_response`). Coercing each entry to a
+    clamped string means a stray integer costs you one readable note instead.
+    """
+    return [_clamp(item if isinstance(item, str) else str(item), MAX_NOTE_CHARS) for item in items[:MAX_NOTES]]
+
+
+def build_response(result: dict) -> bytes:
+    """Turn `run_step`'s output into the bytes Orizon will accept, and be rated
+    well for.
+
+    ── THE MOST IMPORTANT THING IN THIS FILE ──────────────────────────────────
+    The obvious response is `{"summary": "ok"}`. It is accepted. It returns
+    200. The buyer's trace reads as a success. And it scores 20 out of 100
+    on-chain — the exact score a DEAD ENDPOINT earns — while the step is still
+    billed to the buyer.
+
+    The rule on Orizon's side is one line: for an external (untrusted) agent, a
+    response carrying neither an `artifact` nor a `critic_violations` LIST has
+    proved only that an HTTP handler is alive, so it is rated as a
+    non-delivery. Nothing warns you. The failure is invisible until enough of
+    those ratings drag your weighted score below the routing floor and the
+    planner quietly stops selecting your agent — at which point the evidence is
+    months of "successful" steps.
+
+    So this function guarantees two things about every 200 we send:
+
+      1. `artifact` is a real object with real content in it.
+      2. `critic_violations` is a LIST — a `list`, specifically, of strings.
+
+    Some details that cost people their rating:
+
+      * `validator_violations` is NOT the key. It is not on Orizon's
+        allowlist, so it is dropped before rating ever sees it, and the drop
+        is silent. `critic_violations`.
+      * A list of anything but strings is dropped WHOLE, not filtered — and a
+        dropped list is scored as if you never sent one. `[1, 2]` is worth
+        exactly as much as `{"summary": "ok"}`. Hence `_notes`.
+      * An EMPTY list is worth +10 and is the honest answer when you checked
+        and found nothing. It is a claim, though: do not emit `[]` for work you
+        did not review. A populated list costs 3 points per entry (saturating
+        at 10 entries), so honest self-reporting is cheap — 2 violations still
+        scores 79 against the 20 you get for staying silent.
+      * `source` is dropped. Provenance is stamped by Orizon; you cannot claim
+        it, and the value that would be worth claiming (`"baked"`, 95/100) is
+        specifically why the key is refused.
+
+    And the shape Orizon actually requires: a JSON OBJECT with a non-empty
+    string `summary`. No summary, or a body that is not an object, or an
+    `artifact` that is not an object, fails the step as `invalid_response`.
+    """
+    summary = result.get("summary")
+    if not isinstance(summary, str) or not summary.strip():
+        # A missing summary is `invalid_response` — a failed step. Substituting
+        # one is better than failing over a formatting mistake in our own code.
+        summary = "Step completed."
+    payload: dict[str, object] = {
+        "summary": _clamp(summary.strip(), MAX_SUMMARY_CHARS),
+        # ALWAYS present, even when empty. This is the line that is worth 50
+        # rating points over the naive response.
+        "critic_violations": _notes(result.get("violations") or []),
+    }
+    notes = _notes(result.get("notes") or [])
+    if notes:
+        payload["critic_notes"] = notes
+
+    artifact = result.get("artifact")
+    if isinstance(artifact, dict):
+        files = []
+        for entry in (artifact.get("files") or [])[:MAX_FILES]:
+            if not isinstance(entry, dict):
+                continue
+            path, content = entry.get("path"), entry.get("content")
+            if not isinstance(path, str) or not isinstance(content, str):
+                # Orizon drops a half-formed file entry silently; dropping it
+                # here keeps the count in our summary honest.
+                continue
+            files.append({"path": path[:MAX_PATH_CHARS], "content": content[:MAX_FILE_CHARS]})
+        built: dict[str, object] = {}
+        title = artifact.get("title")
+        if isinstance(title, str) and title.strip():
+            built["title"] = _clamp(title.strip(), MAX_TITLE_CHARS)
+        if files:
+            built["files"] = files
+        preview = artifact.get("preview_html")
+        if isinstance(preview, str):
+            built["preview_html"] = preview[:MAX_FILE_CHARS]
+        if built:
+            payload["artifact"] = built
+
+    # `ensure_ascii=False` keeps the body small and readable; the encoding is
+    # declared in our Content-Type and Orizon decodes UTF-8. Note that unlike
+    # the REQUEST, where the exact bytes are covered by a signature, nothing
+    # about our response is signed, so the serialisation options here are ours
+    # to choose.
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    if len(body) > MAX_RESPONSE_BYTES:
+        # Over 1 MiB Orizon cuts the stream off UNREAD and fails the step as
+        # `oversize_response` — so shedding weight here, in the order of what
+        # costs least, is the difference between a rated delivery and nothing.
+        # `preview_html` goes first: it duplicates a file we are already
+        # sending. The artifact is never dropped entirely, because dropping it
+        # is what takes the rating to 20.
+        artifact_out = payload.get("artifact")
+        if isinstance(artifact_out, dict):
+            artifact_out.pop("preview_html", None)
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    if len(body) > MAX_RESPONSE_BYTES:
+        files_out = payload.get("artifact")
+        if isinstance(files_out, dict) and isinstance(files_out.get("files"), list):
+            files_out["files"] = [
+                {"path": f["path"], "content": f["content"][:8_000]} for f in files_out["files"][:4]
+            ]
+            payload["critic_violations"] = _notes(
+                list(payload["critic_violations"]) + ["the artifact was truncated to fit the 1 MiB response cap"]
+            )
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    return body
