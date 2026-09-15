@@ -18,18 +18,18 @@ services:
     buildCommand: pip install pynacl
     startCommand: python3 agent.py
     envVars:
-      - key: ORIZON_API_BASE
-        value: https://orizon-agents-be-stellar.onrender.com
       - key: ORIZON_NETWORK
         value: testnet
-      # Production refuses an unsigned dispatch. Only turn this off locally.
-      - key: ORIZON_REQUIRE_SIGNATURE
-        value: "true"
       # sync: false means "prompt me in the dashboard" — these are per-deploy
-      # values and must never be committed. ORIZON_ENDPOINT_URL is the exact
-      # URL you bind (the signature covers it, so a trailing slash matters), and
-      # ORIZON_DISPATCH_SIGNER is the G-address from GET /api/stellar/network.
+      # values and must never be committed.
+      #
+      # ORIZON_ENDPOINT_URL is the exact URL you bind. The signature covers it,
+      # so scheme, host, path, case and a trailing slash all matter.
       - key: ORIZON_ENDPOINT_URL
         sync: false
-      - key: ORIZON_DISPATCH_SIGNER
+      # ORIZON_SIGNER is the G-address from GET /api/stellar/network. Setting it
+      # IS what makes this deployment refuse unsigned dispatches — there is no
+      # separate switch, so the pin and the policy can never drift apart. Set it
+      # before you bind, or the agent will serve unsigned requests in production.
+      - key: ORIZON_SIGNER
         sync: false
