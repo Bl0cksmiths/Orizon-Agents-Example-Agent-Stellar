@@ -540,63 +540,36 @@ def run_step(envelope: dict, deadline: float) -> dict:
 
     A partial result is a delivered result. Being cut off is not.
     """
-    intent = _text(envelope, "intent")
-    rationale = _text(envelope, "rationale")
+    intent = _text(envelope, "intent").strip()
     context = envelope.get("context")
     context = context if isinstance(context, dict) else {}
-
-    violations: list[str] = []
-    notes: list[str] = []
+    violations: list[str] = [] if intent else ["the step carried no intent text"]
     sections: list[str] = []
-    truncated = False
 
-    if not intent.strip():
-        violations.append("the step carried no intent text, so the report describes nothing")
-
-    # One "unit of work" per prior step in the context, with a budget check
-    # before each. Real work goes here; the discipline is what matters.
-    for index, (key, value) in enumerate(sorted(context.items())[:MAX_CONTEXT_KEYS]):
+    # One "unit of work" per prior step, with a clock check before each. Your
+    # real work goes here; the discipline around it is what matters.
+    for key, value in sorted(context.items())[:MAX_CONTEXT_KEYS]:
         if time.monotonic() >= deadline:
-            truncated = True
-            violations.append(
-                f"ran out of time after {index} of {min(len(context), MAX_CONTEXT_KEYS)} inputs; "
-                "this report is partial"
-            )
+            violations.append(f"ran out of time after {len(sections)} inputs; this report is partial")
             break
         sections.append(f"<section><h2>{esc(key)}</h2><pre>{esc(value)}</pre></section>")
-    else:
-        if len(context) > MAX_CONTEXT_KEYS:
-            notes.append(f"context carried {len(context)} entries; the first {MAX_CONTEXT_KEYS} were read")
 
-    if not context:
-        notes.append("no prior step output was supplied, so this step had nothing to build on")
-    if not truncated:
-        notes.append(f"finished with {deadline - time.monotonic():.1f}s of working time to spare")
-
-    body = "".join(sections) or "<p>No prior step output was supplied.</p>"
-    title = _clamp(intent.strip() or "Orizon step report", MAX_TITLE_CHARS)
+    title = _clamp(intent or "Orizon step report", MAX_TITLE_CHARS)
     document = (
-        "<!doctype html><html><head><meta charset='utf-8'>"
-        f"<title>{esc(title)}</title></head><body>"
-        f"<h1>{esc(title)}</h1>"
-        f"<p><strong>Rationale.</strong> {esc(rationale)}</p>"
-        f"{body}</body></html>"
-    )
-    if len(document) > MAX_FILE_CHARS:
-        document = document[:MAX_FILE_CHARS]
-        violations.append("the generated document exceeded the size limit and was cut")
+        f"<!doctype html><html><head><meta charset='utf-8'><title>{esc(title)}</title></head>"
+        f"<body><h1>{esc(title)}</h1>"
+        f"<p><strong>Rationale.</strong> {esc(_text(envelope, 'rationale'))}</p>"
+        + ("".join(sections) or "<p>No prior step output was supplied.</p>")
+        + "</body></html>"
+    )[:MAX_FILE_CHARS]
 
-    summary = _clamp(
-        (f"Reported on {len(sections)} prior step(s) for: {intent.strip()}." if intent.strip() else "Produced a step report.")
-        + (" Partial: the deadline was reached." if truncated else ""),
-        MAX_SUMMARY_CHARS,
-    )
-    artifact = {
-        "title": title,
-        "files": [{"path": "report.html", "content": document}],
-        "preview_html": document,
+    return {
+        "summary": _clamp(f"Reported on {len(sections)} prior step(s): {title}", MAX_SUMMARY_CHARS),
+        "artifact": {"title": title, "files": [{"path": "report.html", "content": document}],
+                     "preview_html": document},
+        "violations": violations,
+        "notes": [f"{len(context)} context entries supplied, {len(sections)} read"],
     }
-    return {"summary": summary, "artifact": artifact, "violations": violations, "notes": notes}
 
 
 # ── The response. READ THIS SECTION EVEN IF YOU SKIM THE REST. ──────────────
@@ -662,29 +635,21 @@ def build_response(result: dict) -> bytes:
     if notes:
         payload["critic_notes"] = notes
 
-    artifact = result.get("artifact")
-    if isinstance(artifact, dict):
-        files = []
-        for entry in (artifact.get("files") or [])[:MAX_FILES]:
-            if not isinstance(entry, dict):
-                continue
-            path, content = entry.get("path"), entry.get("content")
-            if not isinstance(path, str) or not isinstance(content, str):
-                # Orizon drops a half-formed file entry silently; dropping it
-                # here keeps the count in our summary honest.
-                continue
-            files.append({"path": path[:MAX_PATH_CHARS], "content": content[:MAX_FILE_CHARS]})
-        built: dict[str, object] = {}
-        title = artifact.get("title")
-        if isinstance(title, str) and title.strip():
-            built["title"] = _clamp(title.strip(), MAX_TITLE_CHARS)
-        if files:
-            built["files"] = files
-        preview = artifact.get("preview_html")
-        if isinstance(preview, str):
-            built["preview_html"] = preview[:MAX_FILE_CHARS]
-        if built:
-            payload["artifact"] = built
+    artifact = result.get("artifact") or {}
+    built: dict[str, object] = {}
+    if isinstance(artifact.get("title"), str) and artifact["title"].strip():
+        built["title"] = _clamp(artifact["title"].strip(), MAX_TITLE_CHARS)
+    files = [
+        {"path": f["path"][:MAX_PATH_CHARS], "content": f["content"][:MAX_FILE_CHARS]}
+        for f in (artifact.get("files") or [])[:MAX_FILES]
+        if isinstance(f, dict) and isinstance(f.get("path"), str) and isinstance(f.get("content"), str)
+    ]
+    if files:
+        built["files"] = files
+    if isinstance(artifact.get("preview_html"), str):
+        built["preview_html"] = artifact["preview_html"][:MAX_FILE_CHARS]
+    if built:
+        payload["artifact"] = built
 
     # Unlike the REQUEST, where the exact bytes are covered by a signature,
     # nothing about our response is signed — so the encoding is ours to choose.
