@@ -452,25 +452,24 @@ def check_envelope(envelope: object, headers) -> dict:
 
 
 # Orizon retries a dispatch exactly once, and ONLY when the connection never
-# established — so in the case it retries, you never ran. But the retry carries
-# the SAME `dispatch_id`, which says something more useful than "you may ignore
-# this": the id is the orchestrator's unit of work, and answering it twice with
-# two different results is a bug.
+# established — so when it retries, you never ran. The retry carries the SAME
+# `dispatch_id`, which tells you the id is the orchestrator's unit of work: two
+# different answers to one id is a bug.
 #
-# So the rule is REPLAY, not reject. Returning the stored bytes is correct and
-# free; answering an error for a duplicate turns a retry that was meant to
-# rescue a failed connection into a failed step.
+# The rule is therefore REPLAY, not reject. Returning the stored bytes is free;
+# answering an error for a duplicate turns a retry that was meant to rescue a
+# failed connection into a failed step.
 #
 # Bounded, because a `dispatch_id` is attacker-supplied the moment you accept
-# unsigned requests. Oldest evicted first, which is safe: a retry follows within
+# unsigned requests. Oldest evicted first is safe: a retry follows within
 # seconds, so an entry old enough to evict is one no retry will ask for.
 #
-# IN MEMORY, and therefore LOST ON RESTART. Fine here, because a retry only
-# happens when nothing ran. If your agent does something that must not happen
-# twice — charges a card, sends mail, writes to a shared bucket — this belongs
-# in the same durable store as the side effect, written in the same
-# transaction. An in-memory ledger in front of an irreversible action is a
-# comfort, not a guarantee.
+# IN MEMORY, and so LOST ON RESTART. Fine here, because a retry only happens
+# when nothing ran. If your agent does something that must not happen twice —
+# charges a card, sends mail, writes to a shared bucket — this belongs in the
+# same durable store as the side effect, written in the same transaction. An
+# in-memory ledger in front of an irreversible action is a comfort, not a
+# guarantee.
 _ANSWERED: OrderedDict[str, bytes] = OrderedDict()
 _ANSWERED_LOCK = threading.Lock()
 _ANSWERED_CAPACITY = 1024
@@ -500,35 +499,29 @@ DEFAULT_DEADLINE_MS = 100_000
 MIN_DEADLINE_MS = 1_000
 MAX_DEADLINE_MS = 600_000
 
-# How much of the stated budget we are willing to spend on WORK.
+# How much of the stated budget we spend on WORK. Half, and that is not
+# timidity: the orchestrator's clock starts BEFORE it connects, so DNS, the TCP
+# and TLS handshakes and the upload of a large `context` are already spent by
+# the time your handler runs. On a host that sleeps between requests, 30 s of a
+# 100 s budget can be gone before your first line executes — and you cannot
+# measure that from inside, because the envelope carries a RELATIVE budget, not
+# an absolute deadline (it has to: the freshness window is +/-300 s, three
+# times the whole budget).
 #
-# Half, and that is not timidity. The orchestrator's clock starts BEFORE it
-# connects to you, so DNS, the TCP handshake, the TLS handshake and the upload
-# of a large `context` are all already spent by the time your handler runs.
-# On a host that sleeps between requests, 30 s of a 100 s budget can be gone
-# before the first line of your code executes — and you cannot measure that
-# from inside, because the envelope carries a RELATIVE budget, not an absolute
-# deadline (it has to: the freshness window is +/-300 s, three times the whole
-# budget, so an absolute timestamp could not be converted into a usable one).
-#
-# What you are buying with the other half is the difference between two very
-# different outcomes. Answer late and the step fails as `response_timeout`: it
-# is NOT retried (the request was on the wire and may have run, so Orizon will
-# not risk billing a buyer twice), it earns 20/100 on-chain, and it is unbilled
-# — you did the work, you got nothing, and your rating went down. Answer early
-# with a partial result and you are paid and rated for what you delivered.
+# The other half buys the difference between two outcomes. Answer late and the
+# step fails as `response_timeout`: NOT retried (the request was on the wire
+# and may have run, so Orizon will not risk billing a buyer twice), 20/100
+# on-chain, and unbilled — you did the work, got nothing, and your rating went
+# down. Answer early with a partial result and you are paid and rated for what
+# you delivered.
 WORK_FRACTION = 0.5
 # Left on top of that for serialising and writing the response body.
 RESPONSE_RESERVE_SECONDS = 1.0
 
 
 def work_deadline(envelope: dict, started: float) -> float:
-    """The monotonic instant by which `run_step` must stop working.
-
-    `started` is taken on the first line of the handler; everything after it
-    counts, and the orchestrator's clock has been running since before it
-    connected.
-    """
+    """The monotonic instant by which `run_step` must stop working. `started`
+    is taken on the handler's first line; everything after it counts."""
     raw = envelope.get("deadline_ms")
     if not isinstance(raw, int) or isinstance(raw, bool) or not (MIN_DEADLINE_MS <= raw <= MAX_DEADLINE_MS):
         logger.warning("deadline_ms=%r is unusable — assuming %d ms", raw, DEFAULT_DEADLINE_MS)
@@ -542,12 +535,9 @@ def work_deadline(envelope: dict, started: float) -> float:
 
 
 def _clamp(text: str, limit: int) -> str:
-    """Cut `text` to `limit`, marking it so a truncation reads as one.
-
-    Orizon clamps every field it accepts. Clamping here instead means the cut
-    happens where you can see it and describe it, rather than arriving in the
-    buyer's trace as your prose stopping mid-sentence.
-    """
+    """Cut `text` to `limit`, marked so a truncation reads as one. Orizon
+    clamps every field it accepts; doing it here means the cut happens where
+    you can see it, not in the buyer's trace as prose stopping mid-sentence."""
     if len(text) <= limit:
         return text
     return text[: max(0, limit - 14)] + " ...[truncated]"
@@ -577,8 +567,8 @@ def run_step(envelope: dict, deadline: float) -> dict:
     """Do the work, finishing before `deadline`, and return the response parts.
 
     The reference implementation writes a small HTML report of the step it was
-    given — enough to be a real artifact rather than a placeholder — and
-    reviews its own output. Replace the body; keep the shape:
+    given — a real artifact rather than a placeholder — and reviews its own
+    output. Replace the body; keep the shape:
 
       * check the clock between units of work, not only at the top,
       * never let one unit run unbounded (if yours calls a model or an API,
@@ -652,13 +642,9 @@ def run_step(envelope: dict, deadline: float) -> dict:
 
 
 def _notes(items: list[str]) -> list[str]:
-    """A critic list, clamped to what Orizon will accept.
-
-    Clamped here rather than there because Orizon drops a malformed list WHOLE
-    — one non-string in `critic_violations` and the entire key disappears,
-    taking your rating with it (see `build_response`). Coercing each entry to a
-    clamped string means a stray integer costs you one readable note instead.
-    """
+    """A critic list, clamped to what Orizon will accept. Coerced to strings
+    because Orizon drops a malformed list WHOLE — one non-string in
+    `critic_violations` and the key disappears, taking your rating with it."""
     return [_clamp(item if isinstance(item, str) else str(item), MAX_NOTE_CHARS) for item in items[:MAX_NOTES]]
 
 
@@ -667,44 +653,38 @@ def build_response(result: dict) -> bytes:
     well for.
 
     ── THE MOST IMPORTANT THING IN THIS FILE ──────────────────────────────────
-    The obvious response is `{"summary": "ok"}`. It is accepted. It returns
-    200. The buyer's trace reads as a success. And it scores 20 out of 100
-    on-chain — the exact score a DEAD ENDPOINT earns — while the step is still
+    The obvious response is `{"summary": "ok"}`. It is accepted, it returns
+    200, the buyer's trace reads as a success — and it scores 20 out of 100
+    on-chain, the exact score a DEAD ENDPOINT earns, while the step is still
     billed to the buyer.
 
-    The rule on Orizon's side is one line: for an external (untrusted) agent, a
-    response carrying neither an `artifact` nor a `critic_violations` LIST has
-    proved only that an HTTP handler is alive, so it is rated as a
-    non-delivery. Nothing warns you. The failure is invisible until enough of
-    those ratings drag your weighted score below the routing floor and the
-    planner quietly stops selecting your agent — at which point the evidence is
-    months of "successful" steps.
+    Orizon's rule is one line: for an external (untrusted) agent, a response
+    carrying neither an `artifact` nor a `critic_violations` LIST has proved
+    only that an HTTP handler is alive, so it is rated as a non-delivery.
+    Nothing warns you. It stays invisible until enough of those ratings drag
+    your weighted score below the routing floor and the planner quietly stops
+    selecting your agent — by which point the evidence is months of
+    "successful" steps.
 
-    So this function guarantees two things about every 200 we send:
+    So every 200 we send carries both: an `artifact` with real content, and a
+    `critic_violations` LIST of strings. Details that cost people their rating:
 
-      1. `artifact` is a real object with real content in it.
-      2. `critic_violations` is a LIST — a `list`, specifically, of strings.
-
-    Some details that cost people their rating:
-
-      * `validator_violations` is NOT the key. It is not on Orizon's
-        allowlist, so it is dropped before rating ever sees it, and the drop
-        is silent. `critic_violations`.
-      * A list of anything but strings is dropped WHOLE, not filtered — and a
-        dropped list is scored as if you never sent one. `[1, 2]` is worth
-        exactly as much as `{"summary": "ok"}`. Hence `_notes`.
+      * `validator_violations` is NOT the key — not on Orizon's allowlist, so
+        it is dropped before rating sees it, silently. `critic_violations`.
+      * A list of anything but strings is dropped WHOLE, not filtered, and a
+        dropped list scores as if you sent none: `[1, 2]` is worth exactly what
+        `{"summary": "ok"}` is worth. Hence `_notes`.
       * An EMPTY list is worth +10 and is the honest answer when you checked
-        and found nothing. It is a claim, though: do not emit `[]` for work you
+        and found nothing — but it is a claim, so do not emit `[]` for work you
         did not review. A populated list costs 3 points per entry (saturating
-        at 10 entries), so honest self-reporting is cheap — 2 violations still
-        scores 79 against the 20 you get for staying silent.
-      * `source` is dropped. Provenance is stamped by Orizon; you cannot claim
-        it, and the value that would be worth claiming (`"baked"`, 95/100) is
-        specifically why the key is refused.
+        at 10), so honesty is cheap: 2 violations still scores 79 against the
+        20 you get for staying silent.
+      * `source` is dropped. Provenance is stamped by Orizon, and the value
+        worth claiming (`"baked"`, 95/100) is exactly why the key is refused.
 
-    And the shape Orizon actually requires: a JSON OBJECT with a non-empty
-    string `summary`. No summary, or a body that is not an object, or an
-    `artifact` that is not an object, fails the step as `invalid_response`.
+    The shape Orizon requires: a JSON OBJECT with a non-empty string `summary`.
+    No summary, a body that is not an object, or an `artifact` that is not an
+    object all fail the step as `invalid_response`.
     """
     summary = result.get("summary")
     if not isinstance(summary, str) or not summary.strip():
@@ -745,19 +725,15 @@ def build_response(result: dict) -> bytes:
         if built:
             payload["artifact"] = built
 
-    # `ensure_ascii=False` keeps the body small and readable; the encoding is
-    # declared in our Content-Type and Orizon decodes UTF-8. Note that unlike
-    # the REQUEST, where the exact bytes are covered by a signature, nothing
-    # about our response is signed, so the serialisation options here are ours
-    # to choose.
+    # Unlike the REQUEST, where the exact bytes are covered by a signature,
+    # nothing about our response is signed — so the encoding is ours to choose.
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     if len(body) > MAX_RESPONSE_BYTES:
-        # Over 1 MiB Orizon cuts the stream off UNREAD and fails the step as
-        # `oversize_response` — so shedding weight here, in the order of what
-        # costs least, is the difference between a rated delivery and nothing.
-        # `preview_html` goes first: it duplicates a file we are already
-        # sending. The artifact is never dropped entirely, because dropping it
-        # is what takes the rating to 20.
+        # Past 1 MiB Orizon cuts the stream off UNREAD and fails the step as
+        # `oversize_response`, so shedding weight here is the difference
+        # between a rated delivery and nothing. `preview_html` goes first: it
+        # duplicates a file we are already sending. The artifact itself is
+        # never dropped — dropping it is what takes the rating to 20.
         artifact_out = payload.get("artifact")
         if isinstance(artifact_out, dict):
             artifact_out.pop("preview_html", None)
@@ -771,26 +747,21 @@ def build_response(result: dict) -> bytes:
 
 
 class DispatchHandler(BaseHTTPRequestHandler):
-    # HTTP/1.1 so connections are reused across a workflow's steps, which is
-    # worth several hundred milliseconds of TLS setup out of your budget. It
-    # obliges us to send an accurate Content-Length on every response, which
-    # `_respond` does; get that wrong and the step fails as `transport_error`.
+    # HTTP/1.1 reuses connections across a workflow's steps, worth several
+    # hundred ms of TLS setup out of your budget. It obliges an accurate
+    # Content-Length on every response — get that wrong and the step fails as
+    # `transport_error`.
     protocol_version = "HTTP/1.1"
     server_version = "orizon-example-agent/1"
-    # A read timeout on the connection. Without one, a client that opens a
-    # socket and sends nothing holds a thread until the process dies — the
-    # cheapest denial of service there is against a threaded server.
+    # Without a read timeout, a client that opens a socket and sends nothing
+    # holds a thread until the process dies.
     timeout = 30
 
     def log_message(self, fmt: str, *args) -> None:
-        """Route access logging through `logging`, WITHOUT the request line.
-
-        The default implementation prints `"POST /dispatch?token=… HTTP/1.1"`
-        to stderr. A bound endpoint may legitimately carry a shared secret in
-        its query string, and that is the one thing that must never reach a log
-        file, a log shipper, or a screenshot. So the path is dropped; the
-        outcome is logged where it is produced instead.
-        """
+        """Access logging WITHOUT the request line. The default prints
+        `"POST /dispatch?token=... HTTP/1.1"`, and a bound endpoint may
+        legitimately carry a shared secret in its query string — the one thing
+        that must never reach a log file, a shipper, or a screenshot."""
         logger.debug("http %s", fmt % args)
 
     def _respond(self, status: int, body: bytes) -> None:
@@ -801,28 +772,19 @@ class DispatchHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _refuse(self, status: int, reason: str) -> None:
-        """Answer a request we will not run.
-
-        The body is for YOU, reading curl output — Orizon never parses a
-        non-2xx body, it just records the step as `error_status`. A refused
-        step is not billed, which is why refusing is always cheaper than
-        guessing.
-        """
+        """Answer a request we will not run. The body is for YOU, reading curl
+        output: Orizon never parses a non-2xx body, it records the step as
+        `error_status`. A refused step is not billed."""
         logger.warning("refused dispatch: %s", reason)
         self._respond(status, json.dumps({"error": reason}).encode("utf-8"))
 
     def _read_body(self) -> bytes:
-        """The raw request bytes, bounded, exactly as sent.
-
-        These bytes are what the signature covers, so they are read once and
-        passed around unmodified. Nothing here decodes, strips or normalises
-        them.
-        """
+        """The raw request bytes, bounded, exactly as sent — these are what
+        the signature covers, so nothing here decodes or normalises them."""
         if self.headers.get("Transfer-Encoding", "").lower().strip() == "chunked":
-            # `http.server` does not de-chunk, and Orizon always sends a
-            # Content-Length. Refusing is honest; silently reading the raw
-            # chunk framing as the body would fail the signature check with a
-            # message that sends you looking in entirely the wrong place.
+            # `http.server` does not de-chunk and Orizon always sends a
+            # Content-Length. Reading the raw chunk framing as the body would
+            # fail the signature check and send you looking in the wrong place.
             raise Refused(411, "chunked request bodies are not accepted")
         try:
             length = int(self.headers.get("Content-Length", ""))
@@ -860,8 +822,8 @@ class DispatchHandler(BaseHTTPRequestHandler):
         try:
             raw_body = self._read_body()
 
-            # Order matters: authenticate before parsing. `json.loads` on an
-            # unauthenticated megabyte is work a stranger asked us to do.
+            # Authenticate BEFORE parsing: `json.loads` on an unauthenticated
+            # megabyte is work a stranger asked us to do.
             trust = verify_dispatch(self.headers, raw_body)
 
             try:
@@ -869,20 +831,18 @@ class DispatchHandler(BaseHTTPRequestHandler):
             except (json.JSONDecodeError, UnicodeDecodeError) as e:
                 raise Refused(400, "body is not valid JSON") from e
             except RecursionError as e:
-                # A megabyte of "[[[[..." is ~500k levels deep and defeats
-                # CPython's recursive scanner. RecursionError is a RuntimeError,
-                # so a `except ValueError` would not hold it and it would take
-                # the thread down instead of the request.
+                # A megabyte of "[[[[..." is ~500k deep and defeats CPython's
+                # recursive scanner. RecursionError is a RuntimeError, so an
+                # `except ValueError` does not hold it.
                 raise Refused(400, "body nesting is too deep") from e
 
             envelope = check_envelope(envelope, self.headers)
             dispatch_id = envelope["dispatch_id"]
             deadline = work_deadline(envelope, started)
 
-            # Replay before running. Orizon never sends two copies of one
-            # dispatch concurrently — it retries only after a connection failed,
-            # sequentially — so a plain lookup is enough and a lock around the
-            # whole step is not.
+            # Orizon never sends two copies of one dispatch concurrently — it
+            # retries sequentially, after a connection failed — so a plain
+            # lookup is enough and a lock around the whole step is not.
             prior = recall(dispatch_id)
             if prior is not None:
                 logger.info("dispatch %s replayed from the ledger", dispatch_id)
@@ -903,10 +863,9 @@ class DispatchHandler(BaseHTTPRequestHandler):
             self._refuse(e.status, e.reason)
         except Exception:
             # Our bug, not theirs. A 500 fails the step as `error_status`,
-            # which is NOT billed — strictly better for the buyer, and for you,
-            # than a 200 carrying an apology: that would be billed AND rated
-            # 20/100 for delivering nothing checkable. Never dress a failure up
-            # as a delivery.
+            # which is NOT billed — better for the buyer and for you than a 200
+            # carrying an apology, which would be billed AND rated 20/100 for
+            # delivering nothing checkable. Never dress a failure as a delivery.
             logger.exception("dispatch failed")
             self._refuse(500, "internal error")
 
@@ -920,16 +879,14 @@ def main() -> None:
             "GET /api/stellar/network -> dispatch_signer and pin it before binding a public URL."
         )
     elif not ENDPOINT_URL.startswith("https://"):
-        # Not fatal — you may be testing behind a tunnel — but a bound endpoint
-        # must be https, and the URL is inside the signed message, so an
-        # http/https mismatch between what you bound and what is configured
-        # here makes EVERY signature fail with no other symptom.
+        # Not fatal — you may be behind a tunnel — but a bound endpoint must
+        # be https, and the URL is inside the signed message, so an http/https
+        # mismatch here makes EVERY signature fail with no other symptom.
         logger.warning("ORIZON_ENDPOINT_URL is not https — it must byte-match the URL you bound")
 
     server = ThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), DispatchHandler)
-    # Threads die with the process; a dispatch in flight at shutdown is a step
-    # that fails and is not retried, which is the correct outcome — the
-    # alternative is a shutdown that hangs on a 100-second budget.
+    # A dispatch in flight at shutdown fails and is not retried, which is
+    # correct: the alternative hangs shutdown on a 100-second budget.
     server.daemon_threads = True
     logger.info(
         "listening on http://%s:%d — bound endpoint %s, network %s, signature %s",
@@ -939,10 +896,9 @@ def main() -> None:
         EXPECTED_NETWORK,
         "required" if PINNED_SIGNER else "NOT CHECKED",
     )
-    # Plain HTTP on purpose. Orizon requires an HTTPS endpoint, and terminating
-    # TLS belongs in front of this process — a reverse proxy, a platform
-    # router, a tunnel — not in a file whose job is to be readable. Bind to
-    # 127.0.0.1 (the default) and let that proxy be the only thing exposed.
+    # Plain HTTP on purpose. Orizon requires an HTTPS endpoint, and TLS
+    # termination belongs in front of this process — a reverse proxy, a
+    # platform router, a tunnel — not in a file whose job is to be readable.
     try:
         server.serve_forever()
     except KeyboardInterrupt:
