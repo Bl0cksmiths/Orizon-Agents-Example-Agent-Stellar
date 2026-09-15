@@ -33,12 +33,18 @@ THEIR_URL = "https://competitor.example/dispatch"
 # ── Helpers: the orchestrator's side of the wire, rebuilt from the spec ──────
 
 
-def g_address(verify_key) -> str:
-    """Encode a `G…` strkey. The inverse of `agent.decode_g_address`, written
+def strkey(version_byte: int, raw: bytes) -> str:
+    """Encode a strkey. The inverse of `agent.decode_g_address`, written
     independently here so the pair is a real round trip rather than one
-    function agreeing with itself."""
-    payload = b"\x30" + bytes(verify_key)
+    function agreeing with itself. The version byte is a parameter so a test
+    can build an address of the WRONG kind without a literal seed-shaped
+    string sitting in a public repository."""
+    payload = bytes([version_byte]) + raw
     return base64.b32encode(payload + struct.pack("<H", binascii.crc_hqx(payload, 0))).decode()
+
+
+def g_address(verify_key) -> str:
+    return strkey(0x30, bytes(verify_key))  # 0x30 is "ed25519 public key"
 
 
 def serialize(envelope: dict) -> bytes:
@@ -110,18 +116,23 @@ def test_g_address_round_trips(key):
     assert agent.decode_g_address(g_address(key.verify_key)) == bytes(key.verify_key)
 
 
-@pytest.mark.parametrize(
-    "bad",
-    [
-        "",
-        "GAAA",  # too short
-        "SBMY6OG6FDYPLADYOOP5NZOGTQPWY2MIMEJBC5ZSEY5ANMZ4AWKYQGTR",  # secret, not a key
-        "GBMY6OG6FDYPLADYOOP5NZOGTQPWY2MIMEJBC5ZSEY5ANMZ4AWKYQGTQ",  # last char flipped
-    ],
-)
-def test_g_address_rejects_junk(bad):
-    with pytest.raises(ValueError):
-        agent.decode_g_address(bad)
+def test_g_address_rejects_junk(key):
+    valid = g_address(key.verify_key)
+    cases = {
+        "empty": "",
+        "too short": "GAAA",
+        "lowercased": valid.lower(),
+        # 0x90 is the ed25519 SECRET SEED version byte: a well-formed strkey of
+        # entirely the wrong kind, which the version check is what catches.
+        "wrong version byte": strkey(0x90, bytes(32)),
+        # One character moved: the CRC16 is what turns a mistyped address into
+        # an error here instead of an afternoon of "every signature is invalid".
+        "mistyped": valid[:-1] + ("A" if valid[-1] != "A" else "B"),
+    }
+    for name, bad in cases.items():
+        with pytest.raises(ValueError):
+            agent.decode_g_address(bad)
+            pytest.fail(f"{name} was accepted")
 
 
 def test_sep53_hash_is_the_prefixed_digest():
