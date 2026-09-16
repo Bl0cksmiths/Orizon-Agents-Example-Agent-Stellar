@@ -14,8 +14,11 @@ services:
     name: orizon-reference-agent
     runtime: python
     plan: free
+    # The interpreter version comes from .python-version at the repo root, not
+    # from here. Render's default moves when Render decides it moves; a build
+    # that only ever ran on the default is a build you did not choose.
     # Render injects PORT; agent.py reads it. Do not hardcode a port here.
-    buildCommand: pip install pynacl
+    buildCommand: pip install -r requirements.txt
     startCommand: python3 agent.py
     envVars:
       - key: ORIZON_NETWORK
