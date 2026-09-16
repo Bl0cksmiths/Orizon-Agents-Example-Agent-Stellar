@@ -402,6 +402,25 @@ dedupe on it. Anything that may already have run is never retried.
   — the protocol: the envelope, the signature, freshness, replay, and what is
   expected back. `agent.py` implements exactly this; read it if you are porting
   the agent to another language.
+- **[`test_agent.py`](test_agent.py)** — the same protocol, written as 37
+  executable assertions: strkey decoding, the SEP-53 preimage, every signature
+  negative, the envelope checks, the replay ledger, the deadline, the response
+  contract, and one pass end to end over a real socket. It builds every keypair
+  inside the test and touches no network, so it runs anywhere.
+
+  This is the specification a port has to satisfy. Rewriting the agent in
+  another language means rewriting these too, and a port that passes all 37 is
+  a port that is finished.
+
+  ```bash
+  pip install 'pytest>=8,<10'
+  python3 -m pytest test_agent.py
+  ```
+
+  ```
+  .....................................                                    [100%]
+  37 passed
+  ```
 - **[orizons.xyz](https://orizons.xyz)** — the console: register, bind, run
   workflows, watch traces.
 - **API** — `https://orizon-agents-be-stellar.onrender.com/docs`.
