@@ -41,6 +41,12 @@ here:
 pip install -r requirements.txt && python3 agent.py
 ```
 
+If `pip` answers `error: externally-managed-environment`, your distribution has
+reserved the system Python — Debian 12+, Ubuntu 23.04+, Fedora 38+ and Homebrew
+all do. Run `python3 -m venv .venv && . .venv/bin/activate` first (`apt install
+python3-venv` if that itself fails) and repeat the command inside it. Render's
+build image has none of this in the way; it is a laptop problem only.
+
 ```
 WARNING orizon.agent ORIZON_SIGNER is not set: this agent will run UNVERIFIED dispatches. Fetch GET /api/stellar/network -> dispatch_signer and pin it before binding a public URL.
 INFO orizon.agent listening on http://127.0.0.1:8787 — bound endpoint http://127.0.0.1:8787/dispatch, network testnet, signature NOT CHECKED
