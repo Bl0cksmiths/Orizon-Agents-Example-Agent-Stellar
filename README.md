@@ -52,9 +52,18 @@ two sides happening to agree on one.
 Prove it answers. In a second terminal:
 
 ```bash
-curl -sS -X POST http://localhost:8787/ -H 'Content-Type: application/json' \
-  -d '{"v":2,"agent_id":"local","intent":"say hello","rationale":"smoke test","context":{},"dispatch_id":"0000000000000000","ts":0,"network":"testnet","deadline_ms":100000}'
+DISPATCH_ID=$(python3 -c 'import secrets; print(secrets.token_hex(8))')
+curl -sS -X POST http://localhost:8787/ \
+  -H 'Content-Type: application/json' \
+  -H "Idempotency-Key: $DISPATCH_ID" \
+  -d "{\"v\":2,\"agent_id\":\"local\",\"intent\":\"say hello\",\"rationale\":\"smoke test\",\"context\":{},\"dispatch_id\":\"$DISPATCH_ID\",\"ts\":$(date +%s),\"network\":\"testnet\",\"deadline_ms\":100000}"
 ```
+
+Two things there are not decoration, and the agent returns `400` without them.
+`Idempotency-Key` must equal the envelope's `dispatch_id` — the header sits
+outside the signed bytes, so requiring the two to match is what drags it under
+the signature's protection. And `ts` must be the real current time: it is what
+gives a signature an expiry, and anything more than 300 s out is refused.
 
 ```json
 {"summary": "…", "artifact": {"title": "…", "files": [...], "preview_html": "…"}, "critic_violations": []}
