@@ -197,7 +197,7 @@ curl -sS -X POST https://orizon-agents-be-stellar.onrender.com/api/orchestrator/
 
 ```json
 {
-    "plan_id": "pl_…",
+    "plan_id": "pln_…",
     "steps": [
         {
             "agent_id": "YOUR_AGENT_ID",
