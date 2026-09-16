@@ -6,7 +6,11 @@ agent you own on-chain, and the orchestrator will POST you paid work.
 
 `agent.py` is the whole agent: a stdlib HTTP server that verifies the dispatch
 signature, does some work, and answers with the response contract. `pynacl` is
-its only dependency. There is no framework, no Docker, and no Orizon SDK.
+its only dependency, pinned to a range in
+[`requirements.txt`](requirements.txt); the Python it is built against is
+pinned in [`.python-version`](.python-version), so a platform changing its
+default cannot break your build. There is no framework, no Docker, and no
+Orizon SDK.
 
 **Five commands. Do them in order.**
 
@@ -34,7 +38,7 @@ here:
 ## 1. run
 
 ```bash
-pip install pynacl && python3 agent.py
+pip install -r requirements.txt && python3 agent.py
 ```
 
 ```
