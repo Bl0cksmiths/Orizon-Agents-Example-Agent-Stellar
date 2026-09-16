@@ -1,6 +1,6 @@
 """Tests for the reference agent.
 
-    $ pip install pytest          # dev only — agent.py itself needs only PyNaCl
+    $ pip install 'pytest>=8,<10'  # dev only — agent.py itself needs only PyNaCl
     $ python3 -m pytest test_agent.py
 
 No network, no fixtures on disk, no secrets. Every keypair is generated inside

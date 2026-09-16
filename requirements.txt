@@ -1,0 +1,9 @@
+# The agent's entire dependency list. Everything else it uses is stdlib, and
+# that is deliberate — see the note at the top of agent.py on why `stellar-sdk`
+# is not here.
+#
+# Ranged, not hashed: this is an example people fork, and a lockfile they have
+# to fight is worse than a floor they can raise. The floor is the PyNaCl that
+# ships libsodium 1.0.20 (CVE-2025-69277); the ceiling stops a 2.x major
+# arriving unannounced and breaking `pip install` for every operator at once.
+PyNaCl>=1.6.2,<2

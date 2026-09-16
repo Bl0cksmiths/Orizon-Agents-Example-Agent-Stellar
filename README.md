@@ -6,7 +6,11 @@ agent you own on-chain, and the orchestrator will POST you paid work.
 
 `agent.py` is the whole agent: a stdlib HTTP server that verifies the dispatch
 signature, does some work, and answers with the response contract. `pynacl` is
-its only dependency. There is no framework, no Docker, and no Orizon SDK.
+its only dependency, pinned to a range in
+[`requirements.txt`](requirements.txt); the Python it is built against is
+pinned in [`.python-version`](.python-version), so a platform changing its
+default cannot break your build. There is no framework, no Docker, and no
+Orizon SDK.
 
 **Five commands. Do them in order.**
 
@@ -34,22 +38,42 @@ here:
 ## 1. run
 
 ```bash
-pip install pynacl && python3 agent.py
+pip install -r requirements.txt && python3 agent.py
 ```
 
+If `pip` answers `error: externally-managed-environment`, your distribution has
+reserved the system Python — Debian 12+, Ubuntu 23.04+, Fedora 38+ and Homebrew
+all do. Run `python3 -m venv .venv && . .venv/bin/activate` first (`apt install
+python3-venv` if that itself fails) and repeat the command inside it. Render's
+build image has none of this in the way; it is a laptop problem only.
+
 ```
-orizon reference agent listening on http://0.0.0.0:8080
+WARNING orizon.agent ORIZON_SIGNER is not set: this agent will run UNVERIFIED dispatches. Fetch GET /api/stellar/network -> dispatch_signer and pin it before binding a public URL.
+INFO orizon.agent listening on http://127.0.0.1:8787 — bound endpoint http://127.0.0.1:8787/dispatch, network testnet, signature NOT CHECKED
 ```
 
-`PORT` is read from the environment and defaults to `8080`, which is the only
-reason this same command works unchanged on Render in step 2.
+Locally that is **127.0.0.1:8787** — `ORIZON_PORT`, default 8787, loopback only.
+On Render, Fly and Heroku the platform injects `PORT`; it always wins over
+`ORIZON_PORT`, and its presence is also what moves the bind address to `0.0.0.0`
+so the platform's router can reach the process. That is why this same command
+works unchanged in step 2 — the platform hands the agent a port, rather than the
+two sides happening to agree on one.
 
 Prove it answers. In a second terminal:
 
 ```bash
-curl -sS -X POST http://localhost:8080/ -H 'Content-Type: application/json' \
-  -d '{"v":2,"agent_id":"local","intent":"say hello","rationale":"smoke test","context":{},"dispatch_id":"0000000000000000","ts":0,"network":"testnet","deadline_ms":100000}'
+DISPATCH_ID=$(python3 -c 'import secrets; print(secrets.token_hex(8))')
+curl -sS -X POST http://localhost:8787/ \
+  -H 'Content-Type: application/json' \
+  -H "Idempotency-Key: $DISPATCH_ID" \
+  -d "{\"v\":2,\"agent_id\":\"local\",\"intent\":\"say hello\",\"rationale\":\"smoke test\",\"context\":{},\"dispatch_id\":\"$DISPATCH_ID\",\"ts\":$(date +%s),\"network\":\"testnet\",\"deadline_ms\":100000}"
 ```
+
+Two things there are not decoration, and the agent returns `400` without them.
+`Idempotency-Key` must equal the envelope's `dispatch_id` — the header sits
+outside the signed bytes, so requiring the two to match is what drags it under
+the signature's protection. And `ts` must be the real current time: it is what
+gives a signature an expiry, and anything more than 300 s out is refused.
 
 ```json
 {"summary": "…", "artifact": {"title": "…", "files": [...], "preview_html": "…"}, "critic_violations": []}
@@ -179,7 +203,7 @@ curl -sS -X POST https://orizon-agents-be-stellar.onrender.com/api/orchestrator/
 
 ```json
 {
-    "plan_id": "pl_…",
+    "plan_id": "pln_…",
     "steps": [
         {
             "agent_id": "YOUR_AGENT_ID",
@@ -384,6 +408,25 @@ dedupe on it. Anything that may already have run is never retried.
   — the protocol: the envelope, the signature, freshness, replay, and what is
   expected back. `agent.py` implements exactly this; read it if you are porting
   the agent to another language.
+- **[`test_agent.py`](test_agent.py)** — the same protocol, written as 37
+  executable assertions: strkey decoding, the SEP-53 preimage, every signature
+  negative, the envelope checks, the replay ledger, the deadline, the response
+  contract, and one pass end to end over a real socket. It builds every keypair
+  inside the test and touches no network, so it runs anywhere.
+
+  This is the specification a port has to satisfy. Rewriting the agent in
+  another language means rewriting these too, and a port that passes all 37 is
+  a port that is finished.
+
+  ```bash
+  pip install 'pytest>=8,<10'
+  python3 -m pytest test_agent.py
+  ```
+
+  ```
+  .....................................                                    [100%]
+  37 passed
+  ```
 - **[orizons.xyz](https://orizons.xyz)** — the console: register, bind, run
   workflows, watch traces.
 - **API** — `https://orizon-agents-be-stellar.onrender.com/docs`.
