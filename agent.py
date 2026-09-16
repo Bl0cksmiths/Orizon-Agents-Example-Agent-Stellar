@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """The Orizon Agents reference external agent.
 
-    $ pip install pynacl
+    $ pip install -r requirements.txt
     $ python3 agent.py
 
 Orizon's orchestrator plans a buyer's workflow, picks an agent for each step,
