@@ -38,16 +38,21 @@ pip install pynacl && python3 agent.py
 ```
 
 ```
-orizon reference agent listening on http://0.0.0.0:8080
+WARNING orizon.agent ORIZON_SIGNER is not set: this agent will run UNVERIFIED dispatches. Fetch GET /api/stellar/network -> dispatch_signer and pin it before binding a public URL.
+INFO orizon.agent listening on http://127.0.0.1:8787 — bound endpoint http://127.0.0.1:8787/dispatch, network testnet, signature NOT CHECKED
 ```
 
-`PORT` is read from the environment and defaults to `8080`, which is the only
-reason this same command works unchanged on Render in step 2.
+Locally that is **127.0.0.1:8787** — `ORIZON_PORT`, default 8787, loopback only.
+On Render, Fly and Heroku the platform injects `PORT`; it always wins over
+`ORIZON_PORT`, and its presence is also what moves the bind address to `0.0.0.0`
+so the platform's router can reach the process. That is why this same command
+works unchanged in step 2 — the platform hands the agent a port, rather than the
+two sides happening to agree on one.
 
 Prove it answers. In a second terminal:
 
 ```bash
-curl -sS -X POST http://localhost:8080/ -H 'Content-Type: application/json' \
+curl -sS -X POST http://localhost:8787/ -H 'Content-Type: application/json' \
   -d '{"v":2,"agent_id":"local","intent":"say hello","rationale":"smoke test","context":{},"dispatch_id":"0000000000000000","ts":0,"network":"testnet","deadline_ms":100000}'
 ```
 
