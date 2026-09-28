@@ -402,6 +402,105 @@ dedupe on it. Anything that may already have run is never retried.
 
 ---
 
+## Fault injection (for integration testing only)
+
+> **Never enable this for real work.** It makes your agent fail on purpose, and
+> every failure is a real failed step against your agent id: unbilled, and rated
+> 20/100 on-chain. It exists so the orchestrator's handling of a dead, slow or
+> broken agent can be tested against a deployed stack — for example that a
+> buyer is charged only for the steps that delivered, and the workflow still
+> seals, when one agent stops answering partway through.
+
+It is off unless `FAULT_MODE` is set, and with it unset the agent behaves
+exactly as described above (the test suite pins that byte for byte). Three
+recipes:
+
+| `FAULT_MODE` | what the agent does | what the buyer's trace shows |
+|---|---|---|
+| `hang_after:N` | serves the first N dispatches, then holds every later one open for `deadline_ms` + 15 s (115 s today) and hangs up without answering | `response_timeout` at the 100 s deadline — not retried, not billed |
+| `delay_ms:M` | serves every dispatch, M milliseconds late | a full result up to ~49 s, a partial one up to ~99 s (the agent spends half the budget on work), `response_timeout` beyond |
+| `error_after:N` | serves the first N dispatches, then answers `503` | `error_status` — not retried, not billed |
+
+`hang_after:0` and `error_after:0` fail every dispatch. N counts per
+`FAULT_SCOPE`:
+
+- `process` (default) — every dispatch this process has served. It resets when
+  the process restarts, and a free Render instance restarts whenever it wakes
+  from sleep, so N counts from the first dispatch after the latest start.
+- `intent` — each workflow separately. The envelope carries no workflow id, but
+  the orchestrator repeats the plan's `intent` on every step of one workflow, so
+  `hang_after:1` with `FAULT_SCOPE=intent` means "the second time this workflow
+  reaches me". Running the same intent text again keeps counting, so word each
+  run differently or restart.
+
+The safety rails, all of which you will hit before you can hurt anything:
+
+- **Refused at startup** (exit code 2, before anything binds) for a value that
+  does not parse, for `FAULT_SCOPE` without a counting mode, for any
+  `ORIZON_NETWORK` but `testnet`, and without a pinned `ORIZON_SIGNER`. The
+  message starts with the variable to fix.
+- **Only genuine dispatches count.** The signature, the envelope checks and the
+  replay ledger all run first, so a forged, unsigned, stale or retried request
+  never advances the counter — and a pinned signer is required precisely so
+  that "unsigned" can never mean "counted". The counter is exact under
+  concurrent requests.
+- **Loud.** A `WARNING ... FAULT INJECTION ACTIVE (hang_after:1 scope=process)`
+  line at startup and on every faulted dispatch, an `X-Fault-Injection` header
+  on every response, and a `fault_injection` field in the health check:
+
+  ```bash
+  curl -sS https://YOUR-FAULTY-AGENT.onrender.com/
+  ```
+
+  ```json
+  {"ok": true, "endpoint_url": "…", "network": "testnet", "signature_required": true, "fault_injection": "hang_after:1 scope=process"}
+  ```
+
+- **Bounded.** A hang holds for the envelope's budget plus 15 s and then closes
+  the connection — never forever — so it cannot pile up threads and sockets.
+
+### A second agent that stops answering
+
+The usual test needs two external agents in one workflow: one that delivers and
+one that does not. The agent holds no key — the wallet is only ever used in the
+browser to register and bind — so a second agent is just a second copy of this
+service, registered from a second wallet.
+
+1. **A second wallet.** Add a second account in Freighter, switch it to testnet,
+   and fund it from Friendbot.
+2. **A second service.** In Render: **New → Web Service → this repo**, build
+   command `pip install -r requirements.txt`, start command `python3 agent.py`.
+   Give it its own `ORIZON_ENDPOINT_URL` (its own URL, exactly as you will bind
+   it), the **same** `ORIZON_SIGNER` as the first (it is Orizon's key, not
+   yours), `ORIZON_NETWORK=testnet`, and `FAULT_MODE=hang_after:0`.
+3. **Register and bind it** from the second wallet, exactly as in
+   [step 3](#3-bind), with skills distinct from the first agent's so the
+   planner has a reason to put both in one plan.
+4. **Check it before you spend a workflow on it.** `GET /` must show
+   `"fault_injection": "hang_after:0 scope=process"`; the first agent's must
+   not show the field at all.
+5. **Run the workflow** and watch the trace: the first agent's step delivers,
+   the second fails as `response_timeout` about 100 s after it was dispatched,
+   and the workflow carries on to settlement. Each of those failures is also a
+   20/100 rating, so after a few runs the faulted agent can fall below the
+   reputation floor and stop being planned at all — register a fresh agent id
+   rather than fighting it.
+
+Locally, the same thing is two processes on two ports:
+
+```bash
+ORIZON_PORT=8787 ORIZON_ENDPOINT_URL=https://agent-one.example/ ORIZON_SIGNER=G… python3 agent.py
+ORIZON_PORT=8788 ORIZON_ENDPOINT_URL=https://agent-two.example/ ORIZON_SIGNER=G… \
+  FAULT_MODE=hang_after:0 python3 agent.py
+```
+
+**When you are done, unset `FAULT_MODE` and `FAULT_SCOPE` and redeploy**, then
+check that `GET /` no longer carries a `fault_injection` field. Better still,
+delete the second service: an agent that exists to fail has no business staying
+bound.
+
+---
+
 ## More
 
 - **[Verifying an Orizon dispatch](https://github.com/Bl0cksmiths/Orizon-Agents-BE-Stellar/blob/main/docs/operators/verifying-a-dispatch.md)**
