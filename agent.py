@@ -689,6 +689,9 @@ def build_response(result: dict) -> bytes:
 #                              see `fault_key`
 
 FAULT_KINDS = ("hang_after", "delay_ms", "error_after")
+# Sent on every response while a fault mode is on, alongside a
+# `fault_injection` field in the health check.
+FAULT_HEADER = "X-Fault-Injection"
 FAULT_SCOPES = ("process", "intent")
 # Bounds on the numbers, so a typo cannot become "hold for a year".
 MAX_FAULT_COUNT = 1_000_000
@@ -881,6 +884,10 @@ class DispatchHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        if FAULT is not None:
+            # On every answer, so anyone curling this endpoint — or reading a
+            # proxy log — sees that it is a test rig, not an agent at work.
+            self.send_header(FAULT_HEADER, FAULT.label)
         self.end_headers()
         self.wfile.write(body)
 
@@ -916,8 +923,16 @@ class DispatchHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         """Liveness, plus the settings that are wrong most often."""
-        config = {"ok": True, "endpoint_url": ENDPOINT_URL, "network": EXPECTED_NETWORK,
-                  "signature_required": bool(PINNED_SIGNER)}
+        config = {
+            "ok": True,
+            "endpoint_url": ENDPOINT_URL,
+            "network": EXPECTED_NETWORK,
+            "signature_required": bool(PINNED_SIGNER),
+        }
+        if FAULT is not None:
+            # Only when on, so the health check of an agent without it is
+            # byte-for-byte what it always was.
+            config["fault_injection"] = FAULT.label
         self._respond(200, json.dumps(config).encode("utf-8"))
 
     def do_POST(self) -> None:
@@ -961,6 +976,34 @@ class DispatchHandler(BaseHTTPRequestHandler):
                 logger.info("dispatch %s replayed from the ledger", dispatch_id)
                 self._respond(200, prior)
                 return
+
+            # Fault injection, when switched on. Deliberately THIS far down:
+            # after the signature, the envelope checks and the ledger, so only
+            # a genuine, fresh dispatch is ever counted or faulted.
+            action = fault_action(envelope, trust)
+            if action is not None:
+                fault_kind, seconds = action
+                label = FAULT.label if FAULT is not None else "off"
+                if fault_kind == "hang":
+                    logger.warning(
+                        "FAULT INJECTION (%s): holding dispatch %s for %.0fs, then hanging up unanswered",
+                        label,
+                        dispatch_id,
+                        seconds,
+                    )
+                    time.sleep(seconds)
+                    # No response at all, and no keep-alive: the orchestrator
+                    # abandoned this connection at its deadline, so nothing
+                    # more is read from it or written to it.
+                    self.close_connection = True
+                    return
+                if fault_kind == "error":
+                    logger.warning("FAULT INJECTION (%s): answering dispatch %s with 503", label, dispatch_id)
+                    # Not remembered: the ledger holds deliveries, and this is not one.
+                    self._respond(503, json.dumps({"error": f"fault injection: {label}"}).encode("utf-8"))
+                    return
+                logger.warning("FAULT INJECTION (%s): delaying dispatch %s by %.3fs", label, dispatch_id, seconds)
+                time.sleep(seconds)
 
             body = build_response(run_step(envelope, deadline))
             remember(dispatch_id, body)

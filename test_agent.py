@@ -763,3 +763,95 @@ def test_the_hold_is_bounded_by_the_clamped_budget():
     longest = agent.MAX_DEADLINE_MS / 1000 + margin
     assert agent.fault_hold_seconds(envelope(deadline_ms=agent.MAX_DEADLINE_MS)) == longest
     assert 0 < margin < 60
+
+
+# ── Fault injection: over a real socket ─────────────────────────────────────
+
+
+def signed(key: SigningKey, dispatch_id: str, **overrides) -> tuple[bytes, dict]:
+    body = envelope(dispatch_id=dispatch_id, **overrides)
+    raw = serialize(body)
+    return raw, headers_for(key, OUR_URL, raw, dispatch_id)
+
+
+@pytest.fixture
+def runs(monkeypatch) -> list:
+    """How many times the step itself actually ran."""
+    calls: list = []
+    original = agent.run_step
+    monkeypatch.setattr(agent, "run_step", lambda *a, **kw: (calls.append(1), original(*a, **kw))[1])
+    return calls
+
+
+def test_hang_after_holds_then_hangs_up_unanswered(server, pinned, monkeypatch, runs):
+    fault_on(monkeypatch, "hang_after:1")
+    monkeypatch.setattr(agent, "FAULT_HOLD_MARGIN_SECONDS", 0.3)
+    # deadline_ms=1000 → a 1.3 s hold, so the test runs in seconds, not minutes.
+    status, headers, _ = exchange(server, "POST", *signed(pinned, "aaaa000000000001", deadline_ms=1000))
+    assert status == 200 and headers[agent.FAULT_HEADER] == "hang_after:1 scope=process"
+
+    # It HOLDS: a client that gives up first gets nothing at all.
+    with pytest.raises(TimeoutError):
+        exchange(server, "POST", *signed(pinned, "aaaa000000000002", deadline_ms=1000), timeout=0.6)
+
+    # And the hold is BOUNDED: a patient client sees the connection closed,
+    # with no status line, once the hold is up — not a thread held forever.
+    began = time.monotonic()
+    with pytest.raises(http.client.RemoteDisconnected):
+        exchange(server, "POST", *signed(pinned, "aaaa000000000003", deadline_ms=1000), timeout=5)
+    assert 1.2 <= time.monotonic() - began < 4
+    assert len(runs) == 1, "a hung dispatch must never run the step"
+
+
+def test_error_after_answers_503_after_n(server, pinned, monkeypatch, runs):
+    fault_on(monkeypatch, "error_after:1")
+    assert exchange(server, "POST", *signed(pinned, "bbbb000000000001"))[0] == 200
+    status, headers, answer = exchange(server, "POST", *signed(pinned, "bbbb000000000002"))
+    assert status == 503
+    assert json.loads(answer) == {"error": "fault injection: error_after:1 scope=process"}
+    assert headers[agent.FAULT_HEADER] == "error_after:1 scope=process"
+    assert len(runs) == 1
+
+
+def test_delay_ms_answers_correctly_after_the_delay(server, pinned, monkeypatch):
+    fault_on(monkeypatch, "delay_ms:400")
+    began = time.monotonic()
+    status, headers, answer = exchange(server, "POST", *signed(pinned, "cccc000000000001"))
+    assert time.monotonic() - began >= 0.4
+    assert status == 200 and headers[agent.FAULT_HEADER] == "delay_ms:400"
+    assert synthetic_rating(orizon_parse(json.loads(answer))) == 95
+
+
+def test_unauthenticated_and_invalid_requests_never_advance_the_counter(server, pinned, monkeypatch):
+    fault_on(monkeypatch, "error_after:1")
+    stranger = SigningKey.generate()
+    for i in range(3):  # forged: the attacker's own key, announced in the header
+        assert exchange(server, "POST", *signed(stranger, f"dddd00000000000{i}"))[0] == 401
+    for i in range(2):  # unsigned
+        raw = serialize(envelope(dispatch_id=f"eeee00000000000{i}"))
+        assert exchange(server, "POST", raw, {"Idempotency-Key": f"eeee00000000000{i}"})[0] == 401
+    # Signed by the real key but a refused envelope: authentic, not a dispatch.
+    assert exchange(server, "POST", *signed(pinned, "ffff000000000001", network="public"))[0] == 400
+    assert exchange(server, "GET")[0] == 200
+    assert not agent._FAULT_COUNTS, "nothing above may have been counted"
+
+    assert exchange(server, "POST", *signed(pinned, "abab000000000001"))[0] == 200, "still the first good dispatch"
+    assert exchange(server, "POST", *signed(pinned, "abab000000000002"))[0] == 503
+
+
+def test_a_replayed_dispatch_is_not_counted_twice(server, pinned, monkeypatch):
+    """Orizon's one retry reuses the dispatch_id. It is the same unit of work,
+    so it replays from the ledger and must not use up a second good answer."""
+    fault_on(monkeypatch, "error_after:1")
+    first = exchange(server, "POST", *signed(pinned, "acac000000000001"))
+    again = exchange(server, "POST", *signed(pinned, "acac000000000001"))
+    assert first[0] == again[0] == 200 and first[2] == again[2]
+    assert exchange(server, "POST", *signed(pinned, "acac000000000002"))[0] == 503
+
+
+def test_the_health_check_reports_an_active_fault_mode(server, pinned, monkeypatch):
+    fault_on(monkeypatch, "hang_after:2", scope="intent")
+    status, headers, answer = exchange(server, "GET")
+    assert status == 200
+    assert json.loads(answer)["fault_injection"] == "hang_after:2 scope=intent"
+    assert headers[agent.FAULT_HEADER] == "hang_after:2 scope=intent"
