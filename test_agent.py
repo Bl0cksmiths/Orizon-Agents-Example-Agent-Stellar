@@ -527,3 +527,64 @@ def test_golden_health_is_byte_identical(server, pinned):
         {"ok": True, "endpoint_url": OUR_URL, "network": "testnet", "signature_required": True}
     ).encode("utf-8")
     assert set(headers) == {"Server", "Date", "Content-Type", "Content-Length"}
+
+
+# ── Fault injection: the configuration contract ─────────────────────────────
+
+
+@pytest.fixture
+def fault_env(key) -> dict:
+    """The smallest environment fault injection agrees to start in."""
+    return {"ORIZON_SIGNER": g_address(key.verify_key), "ORIZON_NETWORK": "testnet"}
+
+
+def test_fault_injection_is_off_by_default(fault_env):
+    assert agent.load_fault_config(fault_env) is None
+    assert agent.load_fault_config({}) is None
+    assert agent.FAULT is None, "importing the agent must never switch a fault on"
+
+
+@pytest.mark.parametrize(
+    ("mode", "scope", "label"),
+    [
+        ("hang_after:0", "", "hang_after:0 scope=process"),
+        ("hang_after:3", "intent", "hang_after:3 scope=intent"),
+        ("error_after:2", "process", "error_after:2 scope=process"),
+        ("delay_ms:1500", "", "delay_ms:1500"),
+        ("  delay_ms:1  ", "", "delay_ms:1"),
+    ],
+)
+def test_valid_fault_modes_parse(fault_env, mode, scope, label):
+    config = agent.load_fault_config({**fault_env, "FAULT_MODE": mode, "FAULT_SCOPE": scope})
+    assert config is not None and config.label == label
+
+
+@pytest.mark.parametrize(
+    ("overrides", "named"),
+    [
+        ({"FAULT_MODE": "hang"}, "FAULT_MODE"),
+        ({"FAULT_MODE": "hang_after"}, "FAULT_MODE"),
+        ({"FAULT_MODE": "hang_after:"}, "FAULT_MODE"),
+        ({"FAULT_MODE": "hang_after:-1"}, "FAULT_MODE"),
+        ({"FAULT_MODE": "hang_after:+1"}, "FAULT_MODE"),
+        ({"FAULT_MODE": "hang_after:1.5"}, "FAULT_MODE"),
+        ({"FAULT_MODE": "hang_after:01"}, "FAULT_MODE"),
+        ({"FAULT_MODE": "hang_after:9999999"}, "FAULT_MODE"),
+        ({"FAULT_MODE": "hang_after:٣"}, "FAULT_MODE"),  # a digit to int(), not to us
+        ({"FAULT_MODE": "Hang_After:1"}, "FAULT_MODE"),
+        ({"FAULT_MODE": "crash_after:1"}, "FAULT_MODE"),
+        ({"FAULT_MODE": "delay_ms:0"}, "FAULT_MODE"),
+        ({"FAULT_MODE": "delay_ms:600001"}, "FAULT_MODE"),
+        ({"FAULT_MODE": "error_after:x"}, "FAULT_MODE"),
+        ({"FAULT_MODE": "hang_after:1", "FAULT_SCOPE": "task"}, "FAULT_SCOPE"),
+        ({"FAULT_MODE": "delay_ms:10", "FAULT_SCOPE": "process"}, "FAULT_SCOPE"),
+        ({"FAULT_SCOPE": "process"}, "FAULT_SCOPE"),
+        ({"FAULT_MODE": "hang_after:1", "ORIZON_SIGNER": ""}, "ORIZON_SIGNER"),
+        ({"FAULT_MODE": "hang_after:1", "ORIZON_SIGNER": "GNOTANADDRESS"}, "ORIZON_SIGNER"),
+        ({"FAULT_MODE": "hang_after:1", "ORIZON_NETWORK": "public"}, "ORIZON_NETWORK"),
+    ],
+)
+def test_an_invalid_fault_setting_is_refused_by_name(fault_env, overrides, named):
+    with pytest.raises(agent.FaultConfigError) as exc:
+        agent.load_fault_config({**fault_env, **overrides})
+    assert str(exc.value).startswith(named), f"the message must lead with {named}: {exc.value}"

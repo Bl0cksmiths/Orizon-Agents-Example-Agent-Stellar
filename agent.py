@@ -52,6 +52,7 @@ import struct
 import threading
 import time
 from collections import OrderedDict
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from nacl.exceptions import BadSignatureError
@@ -660,6 +661,113 @@ def build_response(result: dict) -> bytes:
             artifact_out.pop("preview_html", None)
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     return body
+
+
+# ── Fault injection. INTEGRATION TESTING ONLY — never enable it for real work. ───
+#
+# An operator-side switch that makes this agent fail ON PURPOSE, so the
+# orchestrator's handling of a dead, slow or broken agent can be exercised
+# against a deployed stack without editing code at run time. It exists for
+# the evidence run of "an external agent that stops responding partway through
+# a workflow": the buyer must be charged only for delivered steps, and the
+# workflow must still seal.
+#
+# Off unless FAULT_MODE is set. Every failure it causes is a real failed step
+# against YOUR agent id — unbilled, and rated 20/100 on-chain — so an agent
+# with this on is an agent destroying its own reputation. That is why it is
+# refused on any network but testnet, and refused without a pinned signer:
+# only a dispatch that verified against the pinned key ever reaches it, so a
+# stranger's unsigned request cannot move the counter.
+#
+#   FAULT_MODE=hang_after:N    serve N dispatches, then hold every later one
+#                              open past the orchestrator's deadline and hang
+#                              up without answering → `response_timeout`
+#   FAULT_MODE=delay_ms:M      serve every dispatch, M ms late
+#   FAULT_MODE=error_after:N   serve N dispatches, then answer 503 → `error_status`
+#   FAULT_SCOPE=process|intent what N counts: every dispatch this process
+#                              verified (default), or each workflow's own —
+#                              see `fault_key`
+
+FAULT_KINDS = ("hang_after", "delay_ms", "error_after")
+FAULT_SCOPES = ("process", "intent")
+# Bounds on the numbers, so a typo cannot become "hold for a year".
+MAX_FAULT_COUNT = 1_000_000
+MAX_FAULT_DELAY_MS = MAX_DEADLINE_MS
+_FAULT_VALUE_RE = re.compile(r"\A(0|[1-9][0-9]{0,6})\Z")
+
+
+class FaultConfigError(ValueError):
+    """A fault-injection setting we refuse to start with. The message leads
+    with the variable's name, because the person reading it is looking at a
+    dashboard full of them."""
+
+
+@dataclass(frozen=True)
+class FaultConfig:
+    kind: str  # one of FAULT_KINDS
+    value: int  # N dispatches, or M milliseconds
+    scope: str  # one of FAULT_SCOPES
+
+    @property
+    def label(self) -> str:
+        """What the startup log, the health check and every response header say."""
+        if self.kind == "delay_ms":
+            return f"{self.kind}:{self.value}"
+        return f"{self.kind}:{self.value} scope={self.scope}"
+
+
+def load_fault_config(environ) -> FaultConfig | None:
+    """Read FAULT_MODE and FAULT_SCOPE, or raise `FaultConfigError`. None
+    means off, which is the default and changes nothing about the agent.
+
+    Strict on purpose: a value that does not parse is a refusal to start, never
+    a silent fallback, because "I thought the fault was on" and "I thought it
+    was off" are both an evidence run wasted.
+    """
+    mode = environ.get("FAULT_MODE", "").strip()
+    scope_raw = environ.get("FAULT_SCOPE", "").strip()
+    if not mode:
+        if scope_raw:
+            raise FaultConfigError(f"FAULT_SCOPE={scope_raw!r} is set but FAULT_MODE is not")
+        return None
+
+    kind, sep, raw_value = mode.partition(":")
+    if not sep or kind not in FAULT_KINDS:
+        raise FaultConfigError(f"FAULT_MODE={mode!r} is not one of hang_after:N, delay_ms:M, error_after:N")
+    if not _FAULT_VALUE_RE.match(raw_value):
+        raise FaultConfigError(f"FAULT_MODE={mode!r}: {raw_value!r} is not a whole number")
+    value = int(raw_value)
+    limit = MAX_FAULT_DELAY_MS if kind == "delay_ms" else MAX_FAULT_COUNT
+    floor = 1 if kind == "delay_ms" else 0
+    if not (floor <= value <= limit):
+        raise FaultConfigError(f"FAULT_MODE={mode!r}: {kind} must be between {floor} and {limit}")
+
+    if kind == "delay_ms" and scope_raw:
+        raise FaultConfigError(f"FAULT_SCOPE={scope_raw!r} applies only to hang_after and error_after")
+    scope = scope_raw or "process"
+    if scope not in FAULT_SCOPES:
+        raise FaultConfigError(f"FAULT_SCOPE={scope_raw!r} is not one of {', '.join(FAULT_SCOPES)}")
+
+    # The rails. Both name the variable to change, not the fault one.
+    signer = environ.get("ORIZON_SIGNER", "").strip()
+    if not signer:
+        raise FaultConfigError(
+            "ORIZON_SIGNER must be pinned when FAULT_MODE is set: without it anyone who can reach "
+            "this endpoint could advance the fault counter"
+        )
+    try:
+        decode_g_address(signer)
+    except ValueError as e:
+        raise FaultConfigError(f"ORIZON_SIGNER is not a usable address ({e})") from e
+    network = environ.get("ORIZON_NETWORK", "testnet").strip()
+    if network != "testnet":
+        raise FaultConfigError(f"ORIZON_NETWORK={network!r}: FAULT_MODE is refused on any network but testnet")
+    return FaultConfig(kind, value, scope)
+
+
+# Set once, by `main`, before the server starts. None — the default, and the
+# value every import sees — is the agent exactly as it is without this section.
+FAULT: FaultConfig | None = None
 
 
 # ── The server ──────────────────────────────────────────────────────────────
