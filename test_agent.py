@@ -13,13 +13,18 @@ import base64
 import binascii
 import hashlib
 import html
+import http.client
 import json
+import os
 import struct
+import subprocess
+import sys
 import threading
 import time
 import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
+from pathlib import Path
 
 import pytest
 from nacl.signing import SigningKey
@@ -105,8 +110,10 @@ def pinned(monkeypatch, key):
 @pytest.fixture(autouse=True)
 def clean_ledger():
     agent._ANSWERED.clear()
+    agent._FAULT_COUNTS.clear()
     yield
     agent._ANSWERED.clear()
+    agent._FAULT_COUNTS.clear()
 
 
 # ── The strkey and the framing ──────────────────────────────────────────────
@@ -470,3 +477,390 @@ def test_a_body_that_is_not_json_is_refused(server, pinned):
     with pytest.raises(urllib.error.HTTPError) as exc:
         urllib.request.urlopen(request)
     assert exc.value.code == 400
+
+
+# ── The golden: what an operator's agent does when nothing is switched on ────
+#
+# Pinned byte for byte, so anything added alongside the handler — the
+# fault-injection mode below is the reason this exists — is proven to change
+# nothing when it is off. Written against the code BEFORE that mode existed.
+
+GOLDEN_REPORT = (
+    "<!doctype html><html><head><meta charset='utf-8'><title>Design the pricing page</title></head>"
+    "<body><h1>Design the pricing page</h1><p><strong>Rationale.</strong> the planner routed the UI step here</p>"
+    "<section><h2>brief</h2><pre>café</pre></section></body></html>"
+)
+GOLDEN_DISPATCH = {
+    "summary": "Reported on 1 prior step(s): Design the pricing page",
+    "critic_violations": [],
+    "critic_notes": ["1 context entries supplied, 1 read"],
+    "artifact": {
+        "title": "Design the pricing page",
+        "files": [{"path": "report.html", "content": GOLDEN_REPORT}],
+        "preview_html": GOLDEN_REPORT,
+    },
+}
+
+
+def exchange(base: str, method: str, raw: bytes | None = None, headers: dict | None = None, timeout: float = 10):
+    """One request over a fresh connection: (status, headers, body). Lower
+    level than `post` because the golden pins the response headers too."""
+    host, port = base.removeprefix("http://").split(":")
+    connection = http.client.HTTPConnection(host, int(port), timeout=timeout)
+    try:
+        connection.request(method, "/dispatch", body=raw, headers=headers or {})
+        response = connection.getresponse()
+        return response.status, dict(response.getheaders()), response.read()
+    finally:
+        connection.close()
+
+
+def test_golden_dispatch_is_byte_identical(server, pinned):
+    body = envelope(context={"brief": "café"})
+    raw = serialize(body)
+    status, headers, answer = exchange(server, "POST", raw, headers_for(pinned, OUR_URL, raw, body["dispatch_id"]))
+    assert status == 200
+    assert answer == json.dumps(GOLDEN_DISPATCH, ensure_ascii=False).encode("utf-8")
+    # Date and Server vary by clock and interpreter; the rest must not grow.
+    assert set(headers) == {"Server", "Date", "Content-Type", "Content-Length"}
+    assert headers["Content-Type"] == "application/json; charset=utf-8"
+
+
+def test_golden_health_is_byte_identical(server, pinned):
+    status, headers, answer = exchange(server, "GET")
+    assert status == 200
+    assert answer == json.dumps(
+        {"ok": True, "endpoint_url": OUR_URL, "network": "testnet", "signature_required": True}
+    ).encode("utf-8")
+    assert set(headers) == {"Server", "Date", "Content-Type", "Content-Length"}
+
+
+# ── Fault injection: the configuration contract ─────────────────────────────
+
+
+@pytest.fixture
+def fault_env(key) -> dict:
+    """The smallest environment fault injection agrees to start in."""
+    return {"ORIZON_SIGNER": g_address(key.verify_key), "ORIZON_NETWORK": "testnet"}
+
+
+def test_fault_injection_is_off_by_default(fault_env):
+    assert agent.load_fault_config(fault_env) is None
+    assert agent.load_fault_config({}) is None
+    assert agent.FAULT is None, "importing the agent must never switch a fault on"
+
+
+@pytest.mark.parametrize(
+    ("mode", "scope", "label"),
+    [
+        ("hang_after:0", "", "hang_after:0 scope=process"),
+        ("hang_after:3", "intent", "hang_after:3 scope=intent"),
+        ("error_after:2", "process", "error_after:2 scope=process"),
+        ("delay_ms:1500", "", "delay_ms:1500"),
+        ("  delay_ms:1  ", "", "delay_ms:1"),
+    ],
+)
+def test_valid_fault_modes_parse(fault_env, mode, scope, label):
+    config = agent.load_fault_config({**fault_env, "FAULT_MODE": mode, "FAULT_SCOPE": scope})
+    assert config is not None and config.label == label
+
+
+@pytest.mark.parametrize(
+    ("overrides", "named"),
+    [
+        ({"FAULT_MODE": "hang"}, "FAULT_MODE"),
+        ({"FAULT_MODE": "hang_after"}, "FAULT_MODE"),
+        ({"FAULT_MODE": "hang_after:"}, "FAULT_MODE"),
+        ({"FAULT_MODE": "hang_after:-1"}, "FAULT_MODE"),
+        ({"FAULT_MODE": "hang_after:+1"}, "FAULT_MODE"),
+        ({"FAULT_MODE": "hang_after:1.5"}, "FAULT_MODE"),
+        ({"FAULT_MODE": "hang_after:01"}, "FAULT_MODE"),
+        ({"FAULT_MODE": "hang_after:9999999"}, "FAULT_MODE"),
+        ({"FAULT_MODE": "hang_after:٣"}, "FAULT_MODE"),  # a digit to int(), not to us
+        ({"FAULT_MODE": "Hang_After:1"}, "FAULT_MODE"),
+        ({"FAULT_MODE": "crash_after:1"}, "FAULT_MODE"),
+        ({"FAULT_MODE": "delay_ms:0"}, "FAULT_MODE"),
+        ({"FAULT_MODE": "delay_ms:600001"}, "FAULT_MODE"),
+        ({"FAULT_MODE": "error_after:x"}, "FAULT_MODE"),
+        ({"FAULT_MODE": "hang_after:1", "FAULT_SCOPE": "task"}, "FAULT_SCOPE"),
+        ({"FAULT_MODE": "delay_ms:10", "FAULT_SCOPE": "process"}, "FAULT_SCOPE"),
+        ({"FAULT_SCOPE": "process"}, "FAULT_SCOPE"),
+        ({"FAULT_MODE": "hang_after:1", "ORIZON_SIGNER": ""}, "ORIZON_SIGNER"),
+        ({"FAULT_MODE": "hang_after:1", "ORIZON_SIGNER": "GNOTANADDRESS"}, "ORIZON_SIGNER"),
+        ({"FAULT_MODE": "hang_after:1", "ORIZON_NETWORK": "public"}, "ORIZON_NETWORK"),
+    ],
+)
+def test_an_invalid_fault_setting_is_refused_by_name(fault_env, overrides, named):
+    with pytest.raises(agent.FaultConfigError) as exc:
+        agent.load_fault_config({**fault_env, **overrides})
+    assert str(exc.value).startswith(named), f"the message must lead with {named}: {exc.value}"
+
+
+def test_an_unpinned_signer_is_refused_for_what_it_is(fault_env):
+    """Not merely "not an address": the reason a pin is required is that it is
+    what keeps a stranger's request away from the counter, and the message
+    says so."""
+    with pytest.raises(agent.FaultConfigError) as exc:
+        agent.load_fault_config({**fault_env, "FAULT_MODE": "hang_after:1", "ORIZON_SIGNER": "  "})
+    assert "must be pinned" in str(exc.value)
+
+
+def start_agent(env: dict) -> subprocess.CompletedProcess:
+    """`python3 agent.py` as a deploy would run it, stopped at 5 s if it did
+    not refuse. Port 0, so a start that wrongly succeeds binds nothing fixed."""
+    return subprocess.run(
+        [sys.executable, str(Path(agent.__file__))],
+        env={"PATH": os.environ.get("PATH", ""), "ORIZON_PORT": "0", **env},
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+
+
+@pytest.mark.parametrize(
+    ("overrides", "named"),
+    [
+        ({"FAULT_MODE": "hang_after:soon"}, "FAULT_MODE"),
+        ({"FAULT_MODE": "error_after:1", "FAULT_SCOPE": "everywhere"}, "FAULT_SCOPE"),
+        ({"FAULT_MODE": "hang_after:1", "ORIZON_SIGNER": ""}, "ORIZON_SIGNER"),
+    ],
+)
+def test_an_invalid_fault_setting_refuses_to_start(fault_env, overrides, named):
+    started = start_agent({**fault_env, **overrides})
+    assert started.returncode == 2
+    assert f"refusing to start: {named}" in started.stderr
+    assert "listening on" not in started.stderr, "it must refuse before it binds"
+
+
+def test_an_active_fault_mode_announces_itself_before_listening(fault_env):
+    process = subprocess.Popen(
+        [sys.executable, str(Path(agent.__file__))],
+        env={"PATH": os.environ.get("PATH", ""), "ORIZON_PORT": "0", **fault_env, "FAULT_MODE": "hang_after:2"},
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        lines = []
+        for line in process.stderr:
+            lines.append(line)
+            if "listening on" in line:
+                break
+        announced = [i for i, line in enumerate(lines) if "FAULT INJECTION ACTIVE (hang_after:2 scope=process)" in line]
+        assert announced and announced[0] < len(lines) - 1, "".join(lines)
+        assert "WARNING" in lines[announced[0]]
+    finally:
+        process.kill()
+        process.wait(timeout=5)
+
+
+# ── Fault injection: the counter ────────────────────────────────────────────
+
+
+def fault_on(monkeypatch, mode: str, scope: str = "process") -> None:
+    kind, _, value = mode.partition(":")
+    monkeypatch.setattr(agent, "FAULT", agent.FaultConfig(kind, int(value), scope))
+
+
+def test_hang_after_serves_n_then_holds_past_the_deadline(monkeypatch):
+    fault_on(monkeypatch, "hang_after:2")
+    actions = [agent.fault_action(envelope(), agent.VERIFIED) for _ in range(4)]
+    hold = agent.DEFAULT_DEADLINE_MS / 1000 + agent.FAULT_HOLD_MARGIN_SECONDS
+    assert actions == [None, None, ("hang", hold), ("hang", hold)]
+
+
+def test_error_after_serves_n_then_errors(monkeypatch):
+    fault_on(monkeypatch, "error_after:1")
+    assert [agent.fault_action(envelope(), agent.VERIFIED) for _ in range(3)] == [None, ("error", 0.0), ("error", 0.0)]
+
+
+def test_delay_ms_delays_every_dispatch_and_counts_nothing(monkeypatch):
+    fault_on(monkeypatch, "delay_ms:250")
+    assert [agent.fault_action(envelope(), agent.VERIFIED) for _ in range(3)] == [("delay", 0.25)] * 3
+    assert not agent._FAULT_COUNTS
+
+
+def test_an_unverified_dispatch_never_advances_the_counter(monkeypatch):
+    fault_on(monkeypatch, "error_after:0")
+    assert agent.fault_action(envelope(), agent.UNVERIFIED) is None
+    assert not agent._FAULT_COUNTS
+
+
+def test_intent_scope_counts_each_workflow_separately(monkeypatch):
+    """The orchestrator repeats the plan's intent on every step of one
+    workflow, so hang_after:1 under this scope means "the second time THIS
+    workflow reaches me", whatever other workflows did first."""
+    fault_on(monkeypatch, "hang_after:1", scope="intent")
+    first, second = envelope(intent="appraise listing A"), envelope(intent="appraise listing B")
+    assert agent.fault_action(first, agent.VERIFIED) is None
+    assert agent.fault_action(second, agent.VERIFIED) is None, "another workflow's dispatch must not count"
+    assert agent.fault_action(first, agent.VERIFIED)[0] == "hang"
+    assert agent.fault_action(second, agent.VERIFIED)[0] == "hang"
+
+
+def test_process_scope_counts_every_workflow_together(monkeypatch):
+    fault_on(monkeypatch, "hang_after:1")
+    assert agent.fault_action(envelope(intent="appraise listing A"), agent.VERIFIED) is None
+    assert agent.fault_action(envelope(intent="appraise listing B"), agent.VERIFIED)[0] == "hang"
+
+
+def test_the_counter_is_exact_under_concurrency(monkeypatch):
+    """ThreadingHTTPServer answers each dispatch on its own thread. Exactly N
+    must be served — a read-then-write race serves N+k and the step that was
+    meant to hang delivers instead."""
+    fault_on(monkeypatch, "error_after:1000")
+    threads, per_thread = 16, 400
+    same = envelope()
+    barrier = threading.Barrier(threads)
+    results: list = []
+    lock = threading.Lock()
+
+    def dispatch_many():
+        barrier.wait()
+        mine = [agent.fault_action(same, agent.VERIFIED) for _ in range(per_thread)]
+        with lock:
+            results.extend(mine)
+
+    previous = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)  # switch threads as often as CPython will, to give a race every chance
+    try:
+        workers = [threading.Thread(target=dispatch_many) for _ in range(threads)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join()
+    finally:
+        sys.setswitchinterval(previous)
+    assert results.count(None) == 1000
+    assert len(results) == threads * per_thread
+    assert agent._FAULT_COUNTS["process"] == threads * per_thread
+
+
+def test_the_counter_hands_out_distinct_ordinals_under_concurrency():
+    threads, per_thread = 16, 5000
+    barrier = threading.Barrier(threads)
+    seen: list[int] = []
+    lock = threading.Lock()
+
+    def count_many():
+        barrier.wait()
+        mine = [agent.count_dispatch("process") for _ in range(per_thread)]
+        with lock:
+            seen.extend(mine)
+
+    previous = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)
+    try:
+        workers = [threading.Thread(target=count_many) for _ in range(threads)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join()
+    finally:
+        sys.setswitchinterval(previous)
+    assert sorted(seen) == list(range(1, threads * per_thread + 1))
+
+
+def test_the_hold_is_bounded_by_the_clamped_budget():
+    margin = agent.FAULT_HOLD_MARGIN_SECONDS
+    assert agent.fault_hold_seconds(envelope(deadline_ms=100_000)) == 100 + margin
+    # Past the orchestrator's 100 s deadline, which is measured from before it connected.
+    assert agent.fault_hold_seconds(envelope(deadline_ms=100_000)) > 100
+    # An absurd or hostile budget cannot turn the hold into forever.
+    assert agent.fault_hold_seconds(envelope(deadline_ms=10**12)) == agent.DEFAULT_DEADLINE_MS / 1000 + margin
+    assert agent.fault_hold_seconds(envelope(deadline_ms="forever")) == agent.DEFAULT_DEADLINE_MS / 1000 + margin
+    longest = agent.MAX_DEADLINE_MS / 1000 + margin
+    assert agent.fault_hold_seconds(envelope(deadline_ms=agent.MAX_DEADLINE_MS)) == longest
+    assert 0 < margin < 60
+
+
+# ── Fault injection: over a real socket ─────────────────────────────────────
+
+
+def signed(key: SigningKey, dispatch_id: str, **overrides) -> tuple[bytes, dict]:
+    body = envelope(dispatch_id=dispatch_id, **overrides)
+    raw = serialize(body)
+    return raw, headers_for(key, OUR_URL, raw, dispatch_id)
+
+
+@pytest.fixture
+def runs(monkeypatch) -> list:
+    """How many times the step itself actually ran."""
+    calls: list = []
+    original = agent.run_step
+    monkeypatch.setattr(agent, "run_step", lambda *a, **kw: (calls.append(1), original(*a, **kw))[1])
+    return calls
+
+
+def test_hang_after_holds_then_hangs_up_unanswered(server, pinned, monkeypatch, runs):
+    fault_on(monkeypatch, "hang_after:1")
+    monkeypatch.setattr(agent, "FAULT_HOLD_MARGIN_SECONDS", 0.3)
+    # deadline_ms=1000 → a 1.3 s hold, so the test runs in seconds, not minutes.
+    status, headers, _ = exchange(server, "POST", *signed(pinned, "aaaa000000000001", deadline_ms=1000))
+    assert status == 200 and headers[agent.FAULT_HEADER] == "hang_after:1 scope=process"
+
+    # It HOLDS: a client that gives up first gets nothing at all.
+    with pytest.raises(TimeoutError):
+        exchange(server, "POST", *signed(pinned, "aaaa000000000002", deadline_ms=1000), timeout=0.6)
+
+    # And the hold is BOUNDED: a patient client sees the connection closed,
+    # with no status line, once the hold is up — not a thread held forever.
+    began = time.monotonic()
+    with pytest.raises(http.client.RemoteDisconnected):
+        exchange(server, "POST", *signed(pinned, "aaaa000000000003", deadline_ms=1000), timeout=5)
+    assert 1.2 <= time.monotonic() - began < 4
+    assert len(runs) == 1, "a hung dispatch must never run the step"
+
+
+def test_error_after_answers_503_after_n(server, pinned, monkeypatch, runs):
+    fault_on(monkeypatch, "error_after:1")
+    assert exchange(server, "POST", *signed(pinned, "bbbb000000000001"))[0] == 200
+    status, headers, answer = exchange(server, "POST", *signed(pinned, "bbbb000000000002"))
+    assert status == 503
+    assert json.loads(answer) == {"error": "fault injection: error_after:1 scope=process"}
+    assert headers[agent.FAULT_HEADER] == "error_after:1 scope=process"
+    assert len(runs) == 1
+
+
+def test_delay_ms_answers_correctly_after_the_delay(server, pinned, monkeypatch):
+    fault_on(monkeypatch, "delay_ms:400")
+    began = time.monotonic()
+    status, headers, answer = exchange(server, "POST", *signed(pinned, "cccc000000000001"))
+    assert time.monotonic() - began >= 0.4
+    assert status == 200 and headers[agent.FAULT_HEADER] == "delay_ms:400"
+    assert synthetic_rating(orizon_parse(json.loads(answer))) == 95
+
+
+def test_unauthenticated_and_invalid_requests_never_advance_the_counter(server, pinned, monkeypatch):
+    fault_on(monkeypatch, "error_after:1")
+    stranger = SigningKey.generate()
+    for i in range(3):  # forged: the attacker's own key, announced in the header
+        assert exchange(server, "POST", *signed(stranger, f"dddd00000000000{i}"))[0] == 401
+    for i in range(2):  # unsigned
+        raw = serialize(envelope(dispatch_id=f"eeee00000000000{i}"))
+        assert exchange(server, "POST", raw, {"Idempotency-Key": f"eeee00000000000{i}"})[0] == 401
+    # Signed by the real key but a refused envelope: authentic, not a dispatch.
+    assert exchange(server, "POST", *signed(pinned, "ffff000000000001", network="public"))[0] == 400
+    assert exchange(server, "GET")[0] == 200
+    assert not agent._FAULT_COUNTS, "nothing above may have been counted"
+
+    assert exchange(server, "POST", *signed(pinned, "abab000000000001"))[0] == 200, "still the first good dispatch"
+    assert exchange(server, "POST", *signed(pinned, "abab000000000002"))[0] == 503
+
+
+def test_a_replayed_dispatch_is_not_counted_twice(server, pinned, monkeypatch):
+    """Orizon's one retry reuses the dispatch_id. It is the same unit of work,
+    so it replays from the ledger and must not use up a second good answer."""
+    fault_on(monkeypatch, "error_after:1")
+    first = exchange(server, "POST", *signed(pinned, "acac000000000001"))
+    again = exchange(server, "POST", *signed(pinned, "acac000000000001"))
+    assert first[0] == again[0] == 200 and first[2] == again[2]
+    assert exchange(server, "POST", *signed(pinned, "acac000000000002"))[0] == 503
+
+
+def test_the_health_check_reports_an_active_fault_mode(server, pinned, monkeypatch):
+    fault_on(monkeypatch, "hang_after:2", scope="intent")
+    status, headers, answer = exchange(server, "GET")
+    assert status == 200
+    assert json.loads(answer)["fault_injection"] == "hang_after:2 scope=intent"
+    assert headers[agent.FAULT_HEADER] == "hang_after:2 scope=intent"

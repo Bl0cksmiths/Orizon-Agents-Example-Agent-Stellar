@@ -36,6 +36,12 @@ CONFIGURATION — environment variables, all optional, all safe by default
     ORIZON_PORT          Listen port when PORT is absent. Default 8787.
     ORIZON_HOST          Bind address. 0.0.0.0 on a platform, else 127.0.0.1.
     ORIZON_MAX_SKEW      Accepted clock skew on `ts`. Default 300 s.
+
+FAULT INJECTION — integration testing only, off unless set, never for real work
+
+    FAULT_MODE           hang_after:N, delay_ms:M or error_after:N. Makes this
+                         agent fail on purpose; see "Fault injection" below.
+    FAULT_SCOPE          process (default) or intent: what N counts.
 """
 
 from __future__ import annotations
@@ -52,6 +58,7 @@ import struct
 import threading
 import time
 from collections import OrderedDict
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from nacl.exceptions import BadSignatureError
@@ -662,6 +669,202 @@ def build_response(result: dict) -> bytes:
     return body
 
 
+# ── Fault injection. INTEGRATION TESTING ONLY — never enable it for real work. ───
+#
+# An operator-side switch that makes this agent fail ON PURPOSE, so the
+# orchestrator's handling of a dead, slow or broken agent can be exercised
+# against a deployed stack without editing code at run time. It exists for
+# the evidence run of "an external agent that stops responding partway through
+# a workflow": the buyer must be charged only for delivered steps, and the
+# workflow must still seal.
+#
+# Off unless FAULT_MODE is set. Every failure it causes is a real failed step
+# against YOUR agent id — unbilled, and rated 20/100 on-chain — so an agent
+# with this on is an agent destroying its own reputation. That is why it is
+# refused on any network but testnet, and refused without a pinned signer:
+# only a dispatch that verified against the pinned key ever reaches it, so a
+# stranger's unsigned request cannot move the counter.
+#
+#   FAULT_MODE=hang_after:N    serve N dispatches, then hold every later one
+#                              open past the orchestrator's deadline and hang
+#                              up without answering → `response_timeout`
+#   FAULT_MODE=delay_ms:M      serve every dispatch, M ms late
+#   FAULT_MODE=error_after:N   serve N dispatches, then answer 503 → `error_status`
+#   FAULT_SCOPE=process|intent what N counts: every dispatch this process
+#                              verified (default), or each workflow's own —
+#                              see `fault_key`
+
+FAULT_KINDS = ("hang_after", "delay_ms", "error_after")
+# Sent on every response while a fault mode is on, alongside a
+# `fault_injection` field in the health check.
+FAULT_HEADER = "X-Fault-Injection"
+FAULT_SCOPES = ("process", "intent")
+# Bounds on the numbers, so a typo cannot become "hold for a year".
+MAX_FAULT_COUNT = 1_000_000
+MAX_FAULT_DELAY_MS = MAX_DEADLINE_MS
+_FAULT_VALUE_RE = re.compile(r"\A(0|[1-9][0-9]{0,6})\Z")
+
+
+class FaultConfigError(ValueError):
+    """A fault-injection setting we refuse to start with. The message leads
+    with the variable's name, because the person reading it is looking at a
+    dashboard full of them."""
+
+
+@dataclass(frozen=True)
+class FaultConfig:
+    kind: str  # one of FAULT_KINDS
+    value: int  # N dispatches, or M milliseconds
+    scope: str  # one of FAULT_SCOPES
+
+    @property
+    def label(self) -> str:
+        """What the startup log, the health check and every response header say."""
+        if self.kind == "delay_ms":
+            return f"{self.kind}:{self.value}"
+        return f"{self.kind}:{self.value} scope={self.scope}"
+
+
+def load_fault_config(environ) -> FaultConfig | None:
+    """Read FAULT_MODE and FAULT_SCOPE, or raise `FaultConfigError`. None
+    means off, which is the default and changes nothing about the agent.
+
+    Strict on purpose: a value that does not parse is a refusal to start, never
+    a silent fallback, because "I thought the fault was on" and "I thought it
+    was off" are both an evidence run wasted.
+    """
+    mode = environ.get("FAULT_MODE", "").strip()
+    scope_raw = environ.get("FAULT_SCOPE", "").strip()
+    if not mode:
+        if scope_raw:
+            raise FaultConfigError(f"FAULT_SCOPE={scope_raw!r} is set but FAULT_MODE is not")
+        return None
+
+    kind, sep, raw_value = mode.partition(":")
+    if not sep or kind not in FAULT_KINDS:
+        raise FaultConfigError(f"FAULT_MODE={mode!r} is not one of hang_after:N, delay_ms:M, error_after:N")
+    if not _FAULT_VALUE_RE.match(raw_value):
+        raise FaultConfigError(f"FAULT_MODE={mode!r}: {raw_value!r} is not a whole number")
+    value = int(raw_value)
+    limit = MAX_FAULT_DELAY_MS if kind == "delay_ms" else MAX_FAULT_COUNT
+    floor = 1 if kind == "delay_ms" else 0
+    if not (floor <= value <= limit):
+        raise FaultConfigError(f"FAULT_MODE={mode!r}: {kind} must be between {floor} and {limit}")
+
+    if kind == "delay_ms" and scope_raw:
+        raise FaultConfigError(f"FAULT_SCOPE={scope_raw!r} applies only to hang_after and error_after")
+    scope = scope_raw or "process"
+    if scope not in FAULT_SCOPES:
+        raise FaultConfigError(f"FAULT_SCOPE={scope_raw!r} is not one of {', '.join(FAULT_SCOPES)}")
+
+    # The rails. Both name the variable to change, not the fault one.
+    signer = environ.get("ORIZON_SIGNER", "").strip()
+    if not signer:
+        raise FaultConfigError(
+            "ORIZON_SIGNER must be pinned when FAULT_MODE is set: without it anyone who can reach "
+            "this endpoint could advance the fault counter"
+        )
+    try:
+        decode_g_address(signer)
+    except ValueError as e:
+        raise FaultConfigError(f"ORIZON_SIGNER is not a usable address ({e})") from e
+    network = environ.get("ORIZON_NETWORK", "testnet").strip()
+    if network != "testnet":
+        raise FaultConfigError(f"ORIZON_NETWORK={network!r}: FAULT_MODE is refused on any network but testnet")
+    return FaultConfig(kind, value, scope)
+
+
+# Set once, by `main`, before the server starts. None — the default, and the
+# value every import sees — is the agent exactly as it is without this section.
+FAULT: FaultConfig | None = None
+
+# How long past the envelope's own `deadline_ms` a hang holds the connection.
+# Deriving the hold from the signed budget, rather than hard-coding 100 s,
+# keeps it past the orchestrator's deadline if that ever moves — and because
+# `deadline_ms` is clamped to MAX_DEADLINE_MS, it is never longer than ten
+# minutes and a quarter. Bounded, never forever: a hang that never ends leaks
+# a thread and a socket per dispatch until the process falls over.
+FAULT_HOLD_MARGIN_SECONDS = 15.0
+
+# One running count per key (see `fault_key`). Bounded like the replay ledger,
+# oldest first, because under FAULT_SCOPE=intent the keys come from envelopes.
+_FAULT_COUNTS: OrderedDict[str, int] = OrderedDict()
+_FAULT_LOCK = threading.Lock()
+_FAULT_COUNTS_CAPACITY = 1024
+
+
+def fault_key(fault: FaultConfig, envelope: dict) -> str:
+    """What N counts.
+
+    `process`: every verified dispatch this process has served, one counter.
+    Resets on restart — and a free Render instance restarts whenever it wakes
+    from sleep — so hang_after:N with N > 0 counts from the first dispatch
+    after the most recent start.
+
+    `intent`: one counter per workflow. The envelope carries no workflow id,
+    but the orchestrator sends the plan's `intent` unchanged on every step of
+    one workflow (it is `rationale` that differs per step), so "the Nth time
+    this workflow reached this agent" is the Nth dispatch with this intent. A
+    second run of the same intent text keeps counting where the first left
+    off; word each run's intent differently, or restart, to start again at 1.
+    """
+    if fault.scope == "intent":
+        return "intent:" + hashlib.sha256(_text(envelope, "intent").encode("utf-8")).hexdigest()
+    return "process"
+
+
+def count_dispatch(key: str) -> int:
+    """Advance `key`'s counter and return this dispatch's 1-based ordinal.
+
+    The read, the increment and the write happen under one lock, so concurrent
+    dispatches each get a distinct ordinal: exactly N are served, never N+1
+    because two threads read the same count."""
+    with _FAULT_LOCK:
+        ordinal = _FAULT_COUNTS.get(key, 0) + 1
+        _FAULT_COUNTS[key] = ordinal
+        _FAULT_COUNTS.move_to_end(key)
+        while len(_FAULT_COUNTS) > _FAULT_COUNTS_CAPACITY:
+            _FAULT_COUNTS.popitem(last=False)
+        return ordinal
+
+
+def fault_hold_seconds(envelope: dict) -> float:
+    """How long a hang holds: the envelope's budget, clamped exactly as
+    `work_deadline` clamps it, plus the margin. The orchestrator's clock
+    started before it connected, so from its side the hold is longer still."""
+    raw = envelope.get("deadline_ms")
+    if not isinstance(raw, int) or isinstance(raw, bool) or not (MIN_DEADLINE_MS <= raw <= MAX_DEADLINE_MS):
+        raw = DEFAULT_DEADLINE_MS
+    return raw / 1000.0 + FAULT_HOLD_MARGIN_SECONDS
+
+
+def fault_action(envelope: dict, trust: str) -> tuple[str, float] | None:
+    """What fault injection does to this dispatch.
+
+        None             serve it normally
+        ("delay", s)     serve it normally, s seconds late
+        ("hang", s)      hold the connection s seconds, then hang up unanswered
+        ("error", 0.0)   answer 503
+
+    Called only once the signature has verified, the envelope has passed its
+    checks and the replay ledger has had its turn — so a forged, unsigned,
+    stale or replayed request never advances a counter. `trust` is checked
+    again here as well: `main` refuses FAULT_MODE without a pinned signer, so
+    an UNVERIFIED dispatch cannot reach this with a fault on, and if one ever
+    did it would be served normally rather than counted.
+    """
+    fault = FAULT
+    if fault is None or trust != VERIFIED:
+        return None
+    if fault.kind == "delay_ms":
+        return ("delay", fault.value / 1000.0)
+    if count_dispatch(fault_key(fault, envelope)) <= fault.value:
+        return None
+    if fault.kind == "hang_after":
+        return ("hang", fault_hold_seconds(envelope))
+    return ("error", 0.0)
+
+
 # ── The server ──────────────────────────────────────────────────────────────
 
 
@@ -687,6 +890,10 @@ class DispatchHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        if FAULT is not None:
+            # On every answer, so anyone curling this endpoint — or reading a
+            # proxy log — sees that it is a test rig, not an agent at work.
+            self.send_header(FAULT_HEADER, FAULT.label)
         self.end_headers()
         self.wfile.write(body)
 
@@ -722,8 +929,16 @@ class DispatchHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         """Liveness, plus the settings that are wrong most often."""
-        config = {"ok": True, "endpoint_url": ENDPOINT_URL, "network": EXPECTED_NETWORK,
-                  "signature_required": bool(PINNED_SIGNER)}
+        config = {
+            "ok": True,
+            "endpoint_url": ENDPOINT_URL,
+            "network": EXPECTED_NETWORK,
+            "signature_required": bool(PINNED_SIGNER),
+        }
+        if FAULT is not None:
+            # Only when on, so the health check of an agent without it is
+            # byte-for-byte what it always was.
+            config["fault_injection"] = FAULT.label
         self._respond(200, json.dumps(config).encode("utf-8"))
 
     def do_POST(self) -> None:
@@ -768,6 +983,34 @@ class DispatchHandler(BaseHTTPRequestHandler):
                 self._respond(200, prior)
                 return
 
+            # Fault injection, when switched on. Deliberately THIS far down:
+            # after the signature, the envelope checks and the ledger, so only
+            # a genuine, fresh dispatch is ever counted or faulted.
+            action = fault_action(envelope, trust)
+            if action is not None:
+                fault_kind, seconds = action
+                label = FAULT.label if FAULT is not None else "off"
+                if fault_kind == "hang":
+                    logger.warning(
+                        "FAULT INJECTION (%s): holding dispatch %s for %.0fs, then hanging up unanswered",
+                        label,
+                        dispatch_id,
+                        seconds,
+                    )
+                    time.sleep(seconds)
+                    # No response at all, and no keep-alive: the orchestrator
+                    # abandoned this connection at its deadline, so nothing
+                    # more is read from it or written to it.
+                    self.close_connection = True
+                    return
+                if fault_kind == "error":
+                    logger.warning("FAULT INJECTION (%s): answering dispatch %s with 503", label, dispatch_id)
+                    # Not remembered: the ledger holds deliveries, and this is not one.
+                    self._respond(503, json.dumps({"error": f"fault injection: {label}"}).encode("utf-8"))
+                    return
+                logger.warning("FAULT INJECTION (%s): delaying dispatch %s by %.3fs", label, dispatch_id, seconds)
+                time.sleep(seconds)
+
             body = build_response(run_step(envelope, deadline))
             remember(dispatch_id, body)
             logger.info(
@@ -790,7 +1033,23 @@ class DispatchHandler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
+    global FAULT
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+
+    # Before anything binds: a fault setting that does not parse must stop the
+    # deploy here, loudly, not start an agent doing something nobody asked for.
+    try:
+        FAULT = load_fault_config(os.environ)
+    except FaultConfigError as e:
+        logger.critical("refusing to start: %s", e)
+        raise SystemExit(2) from None
+    if FAULT is not None:
+        logger.warning(
+            "FAULT INJECTION ACTIVE (%s): this agent will fail dispatches ON PURPOSE. Integration "
+            "testing on testnet only — every failure is a real 20/100 rating against this agent id. "
+            "Unset FAULT_MODE before this endpoint does real work.",
+            FAULT.label,
+        )
 
     if not PINNED_SIGNER:
         logger.warning(
