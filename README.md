@@ -516,7 +516,7 @@ bound.
 
   This is the specification a port has to satisfy. Rewriting the agent in
   another language means rewriting these too, and a port that passes all 39 is
-  a port that is finished. The 45 after them cover
+  a port that is finished. The 46 after them cover
   [fault injection](#fault-injection-for-integration-testing-only), which is
   test tooling: a port can leave it and its tests out.
 
@@ -526,9 +526,9 @@ bound.
   ```
 
   ```
-  ........................................................................ [ 85%]
-  ............                                                             [100%]
-  84 passed
+  ........................................................................ [ 84%]
+  .............                                                            [100%]
+  85 passed
   ```
 - **[orizons.xyz](https://orizons.xyz)** — the console: register, bind, run
   workflows, watch traces.
