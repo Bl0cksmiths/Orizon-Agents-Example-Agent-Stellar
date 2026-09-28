@@ -769,6 +769,92 @@ def load_fault_config(environ) -> FaultConfig | None:
 # value every import sees — is the agent exactly as it is without this section.
 FAULT: FaultConfig | None = None
 
+# How long past the envelope's own `deadline_ms` a hang holds the connection.
+# Deriving the hold from the signed budget, rather than hard-coding 100 s,
+# keeps it past the orchestrator's deadline if that ever moves — and because
+# `deadline_ms` is clamped to MAX_DEADLINE_MS, it is never longer than ten
+# minutes and a quarter. Bounded, never forever: a hang that never ends leaks
+# a thread and a socket per dispatch until the process falls over.
+FAULT_HOLD_MARGIN_SECONDS = 15.0
+
+# One running count per key (see `fault_key`). Bounded like the replay ledger,
+# oldest first, because under FAULT_SCOPE=intent the keys come from envelopes.
+_FAULT_COUNTS: OrderedDict[str, int] = OrderedDict()
+_FAULT_LOCK = threading.Lock()
+_FAULT_COUNTS_CAPACITY = 1024
+
+
+def fault_key(fault: FaultConfig, envelope: dict) -> str:
+    """What N counts.
+
+    `process`: every verified dispatch this process has served, one counter.
+    Resets on restart — and a free Render instance restarts whenever it wakes
+    from sleep — so hang_after:N with N > 0 counts from the first dispatch
+    after the most recent start.
+
+    `intent`: one counter per workflow. The envelope carries no workflow id,
+    but the orchestrator sends the plan's `intent` unchanged on every step of
+    one workflow (it is `rationale` that differs per step), so "the Nth time
+    this workflow reached this agent" is the Nth dispatch with this intent. A
+    second run of the same intent text keeps counting where the first left
+    off; word each run's intent differently, or restart, to start again at 1.
+    """
+    if fault.scope == "intent":
+        return "intent:" + hashlib.sha256(_text(envelope, "intent").encode("utf-8")).hexdigest()
+    return "process"
+
+
+def count_dispatch(key: str) -> int:
+    """Advance `key`'s counter and return this dispatch's 1-based ordinal.
+
+    The read, the increment and the write happen under one lock, so concurrent
+    dispatches each get a distinct ordinal: exactly N are served, never N+1
+    because two threads read the same count."""
+    with _FAULT_LOCK:
+        ordinal = _FAULT_COUNTS.get(key, 0) + 1
+        _FAULT_COUNTS[key] = ordinal
+        _FAULT_COUNTS.move_to_end(key)
+        while len(_FAULT_COUNTS) > _FAULT_COUNTS_CAPACITY:
+            _FAULT_COUNTS.popitem(last=False)
+        return ordinal
+
+
+def fault_hold_seconds(envelope: dict) -> float:
+    """How long a hang holds: the envelope's budget, clamped exactly as
+    `work_deadline` clamps it, plus the margin. The orchestrator's clock
+    started before it connected, so from its side the hold is longer still."""
+    raw = envelope.get("deadline_ms")
+    if not isinstance(raw, int) or isinstance(raw, bool) or not (MIN_DEADLINE_MS <= raw <= MAX_DEADLINE_MS):
+        raw = DEFAULT_DEADLINE_MS
+    return raw / 1000.0 + FAULT_HOLD_MARGIN_SECONDS
+
+
+def fault_action(envelope: dict, trust: str) -> tuple[str, float] | None:
+    """What fault injection does to this dispatch.
+
+        None             serve it normally
+        ("delay", s)     serve it normally, s seconds late
+        ("hang", s)      hold the connection s seconds, then hang up unanswered
+        ("error", 0.0)   answer 503
+
+    Called only once the signature has verified, the envelope has passed its
+    checks and the replay ledger has had its turn — so a forged, unsigned,
+    stale or replayed request never advances a counter. `trust` is checked
+    again here as well: `main` refuses FAULT_MODE without a pinned signer, so
+    an UNVERIFIED dispatch cannot reach this with a fault on, and if one ever
+    did it would be served normally rather than counted.
+    """
+    fault = FAULT
+    if fault is None or trust != VERIFIED:
+        return None
+    if fault.kind == "delay_ms":
+        return ("delay", fault.value / 1000.0)
+    if count_dispatch(fault_key(fault, envelope)) <= fault.value:
+        return None
+    if fault.kind == "hang_after":
+        return ("hang", fault_hold_seconds(envelope))
+    return ("error", 0.0)
+
 
 # ── The server ──────────────────────────────────────────────────────────────
 

@@ -110,8 +110,10 @@ def pinned(monkeypatch, key):
 @pytest.fixture(autouse=True)
 def clean_ledger():
     agent._ANSWERED.clear()
+    agent._FAULT_COUNTS.clear()
     yield
     agent._ANSWERED.clear()
+    agent._FAULT_COUNTS.clear()
 
 
 # ── The strkey and the framing ──────────────────────────────────────────────
@@ -641,3 +643,123 @@ def test_an_active_fault_mode_announces_itself_before_listening(fault_env):
     finally:
         process.kill()
         process.wait(timeout=5)
+
+
+# ── Fault injection: the counter ────────────────────────────────────────────
+
+
+def fault_on(monkeypatch, mode: str, scope: str = "process") -> None:
+    kind, _, value = mode.partition(":")
+    monkeypatch.setattr(agent, "FAULT", agent.FaultConfig(kind, int(value), scope))
+
+
+def test_hang_after_serves_n_then_holds_past_the_deadline(monkeypatch):
+    fault_on(monkeypatch, "hang_after:2")
+    actions = [agent.fault_action(envelope(), agent.VERIFIED) for _ in range(4)]
+    hold = agent.DEFAULT_DEADLINE_MS / 1000 + agent.FAULT_HOLD_MARGIN_SECONDS
+    assert actions == [None, None, ("hang", hold), ("hang", hold)]
+
+
+def test_error_after_serves_n_then_errors(monkeypatch):
+    fault_on(monkeypatch, "error_after:1")
+    assert [agent.fault_action(envelope(), agent.VERIFIED) for _ in range(3)] == [None, ("error", 0.0), ("error", 0.0)]
+
+
+def test_delay_ms_delays_every_dispatch_and_counts_nothing(monkeypatch):
+    fault_on(monkeypatch, "delay_ms:250")
+    assert [agent.fault_action(envelope(), agent.VERIFIED) for _ in range(3)] == [("delay", 0.25)] * 3
+    assert not agent._FAULT_COUNTS
+
+
+def test_an_unverified_dispatch_never_advances_the_counter(monkeypatch):
+    fault_on(monkeypatch, "error_after:0")
+    assert agent.fault_action(envelope(), agent.UNVERIFIED) is None
+    assert not agent._FAULT_COUNTS
+
+
+def test_intent_scope_counts_each_workflow_separately(monkeypatch):
+    """The orchestrator repeats the plan's intent on every step of one
+    workflow, so hang_after:1 under this scope means "the second time THIS
+    workflow reaches me", whatever other workflows did first."""
+    fault_on(monkeypatch, "hang_after:1", scope="intent")
+    first, second = envelope(intent="appraise listing A"), envelope(intent="appraise listing B")
+    assert agent.fault_action(first, agent.VERIFIED) is None
+    assert agent.fault_action(second, agent.VERIFIED) is None, "another workflow's dispatch must not count"
+    assert agent.fault_action(first, agent.VERIFIED)[0] == "hang"
+    assert agent.fault_action(second, agent.VERIFIED)[0] == "hang"
+
+
+def test_process_scope_counts_every_workflow_together(monkeypatch):
+    fault_on(monkeypatch, "hang_after:1")
+    assert agent.fault_action(envelope(intent="appraise listing A"), agent.VERIFIED) is None
+    assert agent.fault_action(envelope(intent="appraise listing B"), agent.VERIFIED)[0] == "hang"
+
+
+def test_the_counter_is_exact_under_concurrency(monkeypatch):
+    """ThreadingHTTPServer answers each dispatch on its own thread. Exactly N
+    must be served — a read-then-write race serves N+k and the step that was
+    meant to hang delivers instead."""
+    fault_on(monkeypatch, "error_after:1000")
+    threads, per_thread = 16, 400
+    same = envelope()
+    barrier = threading.Barrier(threads)
+    results: list = []
+    lock = threading.Lock()
+
+    def dispatch_many():
+        barrier.wait()
+        mine = [agent.fault_action(same, agent.VERIFIED) for _ in range(per_thread)]
+        with lock:
+            results.extend(mine)
+
+    previous = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)  # switch threads as often as CPython will, to give a race every chance
+    try:
+        workers = [threading.Thread(target=dispatch_many) for _ in range(threads)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join()
+    finally:
+        sys.setswitchinterval(previous)
+    assert results.count(None) == 1000
+    assert len(results) == threads * per_thread
+    assert agent._FAULT_COUNTS["process"] == threads * per_thread
+
+
+def test_the_counter_hands_out_distinct_ordinals_under_concurrency():
+    threads, per_thread = 16, 5000
+    barrier = threading.Barrier(threads)
+    seen: list[int] = []
+    lock = threading.Lock()
+
+    def count_many():
+        barrier.wait()
+        mine = [agent.count_dispatch("process") for _ in range(per_thread)]
+        with lock:
+            seen.extend(mine)
+
+    previous = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)
+    try:
+        workers = [threading.Thread(target=count_many) for _ in range(threads)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join()
+    finally:
+        sys.setswitchinterval(previous)
+    assert sorted(seen) == list(range(1, threads * per_thread + 1))
+
+
+def test_the_hold_is_bounded_by_the_clamped_budget():
+    margin = agent.FAULT_HOLD_MARGIN_SECONDS
+    assert agent.fault_hold_seconds(envelope(deadline_ms=100_000)) == 100 + margin
+    # Past the orchestrator's 100 s deadline, which is measured from before it connected.
+    assert agent.fault_hold_seconds(envelope(deadline_ms=100_000)) > 100
+    # An absurd or hostile budget cannot turn the hold into forever.
+    assert agent.fault_hold_seconds(envelope(deadline_ms=10**12)) == agent.DEFAULT_DEADLINE_MS / 1000 + margin
+    assert agent.fault_hold_seconds(envelope(deadline_ms="forever")) == agent.DEFAULT_DEADLINE_MS / 1000 + margin
+    longest = agent.MAX_DEADLINE_MS / 1000 + margin
+    assert agent.fault_hold_seconds(envelope(deadline_ms=agent.MAX_DEADLINE_MS)) == longest
+    assert 0 < margin < 60
