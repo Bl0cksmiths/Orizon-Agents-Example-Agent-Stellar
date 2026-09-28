@@ -36,6 +36,12 @@ CONFIGURATION — environment variables, all optional, all safe by default
     ORIZON_PORT          Listen port when PORT is absent. Default 8787.
     ORIZON_HOST          Bind address. 0.0.0.0 on a platform, else 127.0.0.1.
     ORIZON_MAX_SKEW      Accepted clock skew on `ts`. Default 300 s.
+
+FAULT INJECTION — integration testing only, off unless set, never for real work
+
+    FAULT_MODE           hang_after:N, delay_ms:M or error_after:N. Makes this
+                         agent fail on purpose; see "Fault injection" below.
+    FAULT_SCOPE          process (default) or intent: what N counts.
 """
 
 from __future__ import annotations
