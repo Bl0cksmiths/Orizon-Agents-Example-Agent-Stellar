@@ -13,6 +13,7 @@ import base64
 import binascii
 import hashlib
 import html
+import http.client
 import json
 import struct
 import threading
@@ -470,3 +471,59 @@ def test_a_body_that_is_not_json_is_refused(server, pinned):
     with pytest.raises(urllib.error.HTTPError) as exc:
         urllib.request.urlopen(request)
     assert exc.value.code == 400
+
+
+# ── The golden: what an operator's agent does when nothing is switched on ────
+#
+# Pinned byte for byte, so anything added alongside the handler — the
+# fault-injection mode below is the reason this exists — is proven to change
+# nothing when it is off. Written against the code BEFORE that mode existed.
+
+GOLDEN_REPORT = (
+    "<!doctype html><html><head><meta charset='utf-8'><title>Design the pricing page</title></head>"
+    "<body><h1>Design the pricing page</h1><p><strong>Rationale.</strong> the planner routed the UI step here</p>"
+    "<section><h2>brief</h2><pre>café</pre></section></body></html>"
+)
+GOLDEN_DISPATCH = {
+    "summary": "Reported on 1 prior step(s): Design the pricing page",
+    "critic_violations": [],
+    "critic_notes": ["1 context entries supplied, 1 read"],
+    "artifact": {
+        "title": "Design the pricing page",
+        "files": [{"path": "report.html", "content": GOLDEN_REPORT}],
+        "preview_html": GOLDEN_REPORT,
+    },
+}
+
+
+def exchange(base: str, method: str, raw: bytes | None = None, headers: dict | None = None, timeout: float = 10):
+    """One request over a fresh connection: (status, headers, body). Lower
+    level than `post` because the golden pins the response headers too."""
+    host, port = base.removeprefix("http://").split(":")
+    connection = http.client.HTTPConnection(host, int(port), timeout=timeout)
+    try:
+        connection.request(method, "/dispatch", body=raw, headers=headers or {})
+        response = connection.getresponse()
+        return response.status, dict(response.getheaders()), response.read()
+    finally:
+        connection.close()
+
+
+def test_golden_dispatch_is_byte_identical(server, pinned):
+    body = envelope(context={"brief": "café"})
+    raw = serialize(body)
+    status, headers, answer = exchange(server, "POST", raw, headers_for(pinned, OUR_URL, raw, body["dispatch_id"]))
+    assert status == 200
+    assert answer == json.dumps(GOLDEN_DISPATCH, ensure_ascii=False).encode("utf-8")
+    # Date and Server vary by clock and interpreter; the rest must not grow.
+    assert set(headers) == {"Server", "Date", "Content-Type", "Content-Length"}
+    assert headers["Content-Type"] == "application/json; charset=utf-8"
+
+
+def test_golden_health_is_byte_identical(server, pinned):
+    status, headers, answer = exchange(server, "GET")
+    assert status == 200
+    assert answer == json.dumps(
+        {"ok": True, "endpoint_url": OUR_URL, "network": "testnet", "signature_required": True}
+    ).encode("utf-8")
+    assert set(headers) == {"Server", "Date", "Content-Type", "Content-Length"}
