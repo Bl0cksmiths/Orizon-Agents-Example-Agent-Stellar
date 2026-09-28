@@ -898,7 +898,23 @@ class DispatchHandler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
+    global FAULT
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+
+    # Before anything binds: a fault setting that does not parse must stop the
+    # deploy here, loudly, not start an agent doing something nobody asked for.
+    try:
+        FAULT = load_fault_config(os.environ)
+    except FaultConfigError as e:
+        logger.critical("refusing to start: %s", e)
+        raise SystemExit(2) from None
+    if FAULT is not None:
+        logger.warning(
+            "FAULT INJECTION ACTIVE (%s): this agent will fail dispatches ON PURPOSE. Integration "
+            "testing on testnet only — every failure is a real 20/100 rating against this agent id. "
+            "Unset FAULT_MODE before this endpoint does real work.",
+            FAULT.label,
+        )
 
     if not PINNED_SIGNER:
         logger.warning(

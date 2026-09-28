@@ -15,12 +15,16 @@ import hashlib
 import html
 import http.client
 import json
+import os
 import struct
+import subprocess
+import sys
 import threading
 import time
 import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
+from pathlib import Path
 
 import pytest
 from nacl.signing import SigningKey
@@ -588,3 +592,52 @@ def test_an_invalid_fault_setting_is_refused_by_name(fault_env, overrides, named
     with pytest.raises(agent.FaultConfigError) as exc:
         agent.load_fault_config({**fault_env, **overrides})
     assert str(exc.value).startswith(named), f"the message must lead with {named}: {exc.value}"
+
+
+def start_agent(env: dict) -> subprocess.CompletedProcess:
+    """`python3 agent.py` as a deploy would run it, stopped at 5 s if it did
+    not refuse. Port 0, so a start that wrongly succeeds binds nothing fixed."""
+    return subprocess.run(
+        [sys.executable, str(Path(agent.__file__))],
+        env={"PATH": os.environ.get("PATH", ""), "ORIZON_PORT": "0", **env},
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+
+
+@pytest.mark.parametrize(
+    ("overrides", "named"),
+    [
+        ({"FAULT_MODE": "hang_after:soon"}, "FAULT_MODE"),
+        ({"FAULT_MODE": "error_after:1", "FAULT_SCOPE": "everywhere"}, "FAULT_SCOPE"),
+        ({"FAULT_MODE": "hang_after:1", "ORIZON_SIGNER": ""}, "ORIZON_SIGNER"),
+    ],
+)
+def test_an_invalid_fault_setting_refuses_to_start(fault_env, overrides, named):
+    started = start_agent({**fault_env, **overrides})
+    assert started.returncode == 2
+    assert f"refusing to start: {named}" in started.stderr
+    assert "listening on" not in started.stderr, "it must refuse before it binds"
+
+
+def test_an_active_fault_mode_announces_itself_before_listening(fault_env):
+    process = subprocess.Popen(
+        [sys.executable, str(Path(agent.__file__))],
+        env={"PATH": os.environ.get("PATH", ""), "ORIZON_PORT": "0", **fault_env, "FAULT_MODE": "hang_after:2"},
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        lines = []
+        for line in process.stderr:
+            lines.append(line)
+            if "listening on" in line:
+                break
+        announced = [i for i, line in enumerate(lines) if "FAULT INJECTION ACTIVE (hang_after:2 scope=process)" in line]
+        assert announced and announced[0] < len(lines) - 1, "".join(lines)
+        assert "WARNING" in lines[announced[0]]
+    finally:
+        process.kill()
+        process.wait(timeout=5)
