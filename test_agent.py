@@ -596,6 +596,15 @@ def test_an_invalid_fault_setting_is_refused_by_name(fault_env, overrides, named
     assert str(exc.value).startswith(named), f"the message must lead with {named}: {exc.value}"
 
 
+def test_an_unpinned_signer_is_refused_for_what_it_is(fault_env):
+    """Not merely "not an address": the reason a pin is required is that it is
+    what keeps a stranger's request away from the counter, and the message
+    says so."""
+    with pytest.raises(agent.FaultConfigError) as exc:
+        agent.load_fault_config({**fault_env, "FAULT_MODE": "hang_after:1", "ORIZON_SIGNER": "  "})
+    assert "must be pinned" in str(exc.value)
+
+
 def start_agent(env: dict) -> subprocess.CompletedProcess:
     """`python3 agent.py` as a deploy would run it, stopped at 5 s if it did
     not refuse. Port 0, so a start that wrongly succeeds binds nothing fixed."""
